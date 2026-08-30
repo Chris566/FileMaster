@@ -5,9 +5,16 @@ W1 阶段：构造 tmp 目录、文件工厂、空配置对象。
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import pytest
+
+# CI/headless 环境自动设 offscreen (无 X11 display 的 runner 会崩)
+# Linux/macOS 都需要;Windows 自动忽略(不影响)
+if sys.platform.startswith(("linux", "darwin")) and not os.environ.get("QT_QPA_PLATFORM"):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 
 @pytest.fixture
