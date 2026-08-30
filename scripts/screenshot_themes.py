@@ -31,7 +31,8 @@ from filemaster.ui.main_window import MainWindow
 
 def main() -> int:
     """渲染 4 套主题并截图."""
-    artifacts = Path(__file__).resolve().parent.parent.parent / "artifacts"
+    # 输出在 repo 内 <repo>/artifacts/screenshots（actions/upload-artifact 不允许 .. 模式）
+    artifacts = Path(__file__).resolve().parent.parent / "artifacts"
     out_dir = artifacts / "screenshots"
     out_dir.mkdir(parents=True, exist_ok=True)
 

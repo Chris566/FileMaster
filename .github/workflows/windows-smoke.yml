@@ -50,7 +50,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-theme-screenshots
-          path: ../artifacts/screenshots/*.png
+          path: artifacts/screenshots/*.png
           retention-days: 14
 
       - name: Build Windows .exe (PyInstaller)
