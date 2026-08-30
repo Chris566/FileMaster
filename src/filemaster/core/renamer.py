@@ -10,6 +10,7 @@ W2 详细实现：
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 import shutil
 from collections.abc import Iterable
@@ -278,7 +279,9 @@ class Renamer:
                     and undo_stack is not None
                 ):
                     backup_path = UndoStack.backup(target, self._backup_dir(undo_stack))
-                file.rename(target)
+                # 使用 os.replace：POSIX 和 Windows 都是原子覆盖语义
+                # Path.rename 在 Windows 上目标已存在会抛 FileExistsError
+                os.replace(file, target)
             except OSError as e:
                 results.append(RenameResult(file, target, "ERROR", str(e)))
                 self._index += 1
