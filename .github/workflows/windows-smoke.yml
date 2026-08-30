@@ -1,0 +1,94 @@
+name: Windows Smoke Test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  windows-smoke:
+    name: Windows 全链路冒烟测试
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest on Windows
+        shell: pwsh
+        run: |
+          pytest -v --tb=short --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-results
+          path: test-results.xml
+          retention-days: 14
+
+      - name: Render 4 theme screenshots (offscreen Qt)
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          python scripts/screenshot_themes.py
+
+      - name: Upload 4 theme screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-theme-screenshots
+          path: ../artifacts/screenshots/*.png
+          retention-days: 14
+
+      - name: Build Windows .exe (PyInstaller)
+        shell: pwsh
+        run: |
+          pip install -e ".[build]"
+          pyinstaller build/filemaster.spec --clean --noconfirm
+
+      - name: Verify .exe exists & show size
+        shell: pwsh
+        run: |
+          if (Test-Path "dist/filemaster.exe") {
+            $size = (Get-Item "dist/filemaster.exe").Length / 1MB
+            Write-Host "OK  filemaster.exe built: $([math]::Round($size, 2)) MB"
+          } else {
+            Write-Host "FAIL  filemaster.exe not found"
+            exit 1
+          }
+
+      - name: Upload .exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: FileMaster-windows-exe
+          path: |
+            dist/filemaster.exe
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Smoke-run .exe (offscreen, 5s)
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $proc = Start-Process -FilePath ".\dist\filemaster.exe" -PassThru
+          Start-Sleep -Seconds 5
+          if (-not $proc.HasExited) {
+            Write-Host "OK  filemaster.exe started successfully, killing after 5s"
+            Stop-Process -Id $proc.Id -Force
+          } else {
+            Write-Host "FAIL  filemaster.exe exited prematurely with code $($proc.ExitCode)"
+            exit 1
+          }

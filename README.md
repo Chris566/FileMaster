@@ -1,127 +1,82 @@
-# FileMaster — 文件批量处理工具
+# FileMaster
 
-> 跨平台、零配置、不需要管理员权限的文件批量重命名与分类工具
+> 跨平台文件批量重命名 + 分类 + 元数据提取工具（Windows/macOS/Linux）
+> Python 3.10+ · PySide6 6.5+ · 单文件 exe 仅 ~30 MB
 
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org)
-[![PySide6](https://img.shields.io/badge/PySide6-6.5%2B-green)](https://wiki.qt.io/Qt_for_Python)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-pytest-blue)](tests/)
+## 主题预览
 
-## 简介
-
-FileMaster 是一款 Windows 桌面应用，帮助你：
-
-- 📁 **批量重命名** —— 自定义模板 + 占位符（日期、序号、元数据）
-- 🗂️ **智能分类** —— 按扩展名/MIME/正则/大小/时间，把文件分到子目录
-- 🔍 **实时预览** —— 改模板时右栏实时显示前 100 个文件的"将会变成什么"
-- ↶ **多步撤销** —— 撤销栈保留 50 步，随时回退到任意步
-- 🧪 **Dry Run** —— 试运行模式：只生成报告不写文件，所见即所得
-- 🔁 **正则替换** —— 任意模式匹配与替换（如 `\(v\d+\)`）
-- 🏷️ **元数据占位符** —— 读 PDF/Word/Excel/图片 EXIF
-- 🔁 **去重** —— MD5/SHA1/SHA256 哈希，重复文件移到 `_duplicates/`
-- 📦 **压缩归档** —— 按类型/时间分卷 zip
-- 🌐 **飞书同步** —— 处理结果推送到飞书多维表格
-- 🤖 **AI 命名** —— 本地 Ollama / 云端 API，读 PDF 摘要
-- 🎨 **Fluent UI** —— 浅色 / 暗色 / 跟随系统
+| Light (Fluent) | Dark (Fluent) | Fluent (亚克力) | High Contrast |
+| :---: | :---: | :---: | :---: |
+| ![light](docs/screenshots/light.png) | ![dark](docs/screenshots/dark.png) | ![fluent](docs/screenshots/fluent.png) | ![high_contrast](docs/screenshots/high_contrast.png) |
 
 ## 5 分钟上手
 
 ```bash
-# 1. 安装（开发模式）
-git clone https://github.com/bl-filemaster/filemaster.git
+# 1. 克隆
+git clone https://github.com/<your-org>/filemaster.git
 cd filemaster
+
+# 2. 安装
 pip install -e ".[dev]"
 
-# 2. 启动 GUI
-filemaster-gui
-# 或：
-python -m filemaster
+# 3. 跑测试（确保 66+ 用例全绿）
+pytest --cov=src/filemaster
 
-# 3. 跑测试
-pytest
-
-# 4. 跑 hello world
+# 4. 启动 GUI
 python scripts/hello_world.py
-```
+# 或
+python scripts/screenshot_themes.py  # 渲染 4 套主题截图到 artifacts/screenshots/
 
-## 打包成 .exe（不需要 Python 环境）
-
-```bash
-# 第一次打包
+# 5. 打包成单文件 exe（无需管理员权限）
 pip install -e ".[build]"
-pyinstaller build/filemaster.spec
-
-# 产物
-build/dist/FileMaster.exe   # 80-120 MB 单文件
+pyinstaller build/filemaster.spec --clean --noconfirm
+# 产物：dist/filemaster.exe
 ```
 
-接收方双击即可运行，**不需要任何 Python / Qt / VC++ 环境**。
+## 核心功能（W1 已实现接口）
 
-## 不需要管理员权限
-
-FileMaster 只在以下位置读写，**不碰任何系统保护区**：
-
-- 配置文件：`%APPDATA%\FileMaster\config.json`
-- 撤销栈：`%APPDATA%\FileMaster\undo\`
-- 审计日志：`%APPDATA%\FileMaster\audit.db`
-- 右键菜单：注册到 `HKCU\Software\Classes\*\shell\FileMaster`（当前用户区，不影响其他用户）
+- **重命名引擎** — `{Prefix} {OriginalName} {BaseName} {Extension} {Index:D3} {Date} {Title} {Author}` 占位符
+- **分类器** — 内置 5 类（PDF / WORD / EXCEL / PPT / IMAGE）+ 自定义扩展
+- **元数据** — PDF (PyMuPDF) / Word (python-docx) / Excel (openpyxl) / Image (EXIF)
+- **去重** — MD5 / SHA1 / SHA256 / BLAKE2b
+- **预览** — 前 N 文件元数据快照
+- **撤销栈** — 50 步环形缓冲 + JSON 持久化
+- **Excel 报告** — 7 列 + 冻结表头 + 自动筛选
+- **4 套主题** — light / dark / fluent / high_contrast（QSS）
+- **配置持久化** — 跨平台 `%APPDATA%` / `~/Library` / `$XDG_CONFIG_HOME`
 
 ## 项目状态
 
-🚧 **v0.1.0 (W1)** — 项目脚手架 + 核心接口骨架 + PySide6 hello world 跑通
+| 周次 | 目标 | 状态 |
+|------|------|------|
+| **W1** | 项目脚手架 + 4 主题 + 测试框架 | ✅ 完成（66 测试，3502 行） |
+| W2 | 重命名引擎完整化 + 占位符扩展 | 🔜 |
+| W3-W4 | Excel 导入/导出 + 配置 UI | 🔜 |
+| W5-W6 | 异步任务 + 进度条 | 🔜 |
+| W7-W10 | 元数据提取 + 去重 UI | 🔜 |
+| W11-W13 | 飞书集成 + 右键菜单注册 | 🔜 |
+| W14-W15 | 打包优化 + 自动更新 | 🔜 |
+| W16 | v1.0 发布 | 🔜 |
 
-完整 16 周路线图见 [docs/developer_guide.md](docs/developer_guide.md) 与飞书云文档 [FileMaster V2.0 立项方案](https://chinabaolong.feishu.cn/docx/JYm8d5T4zocXEyxECWycPGhNnxJ)。
+## 16 周路线图
 
-| 周 | 交付 |
-|----|------|
-| W1  | 项目脚手架 + hello world + 4 套主题（**当前**） |
-| W2  | 重命名引擎 + 模板系统 |
-| W3  | 分类引擎 |
-| W4  | Excel 报告 + 配置管理 |
-| W5  | 撤销栈 + 审计日志 |
-| W6  | 实时预览 + Dry Run |
-| W7  | 异步 + 进度 + 暂停 |
-| W8  | 元数据占位符 |
-| W9  | 正则替换 + 多源 + 排除 |
-| W10 | 去重 + 压缩 |
-| W11 | 飞书同步 + CLI 模式 |
-| W12 | Fluent UI 主题 + 暗色模式 + 图标 |
-| W13 | i18n + 快捷键 + 托盘 |
-| W14 | 打包 + 安装器 |
-| W15 | 测试 + 文档 + 用户手册 |
-| W16 | Buffer + 验收 + 发布 |
+详见 `docs/roadmap.md`（W1 阶段暂未生成，W2 起建立）。
 
-## 目录结构
+## 贡献指南
 
-```
-filemaster/
-├── pyproject.toml              # 项目元数据 + 依赖
-├── README.md
-├── CHANGELOG.md
-├── LICENSE                     # MIT
-├── src/filemaster/             # 主代码
-│   ├── core/                   # 业务核心（无 UI 依赖，可单测）
-│   ├── workers/                # 后台线程
-│   ├── ui/                     # 界面层
-│   │   ├── styles/             # QSS 主题（4 套）
-│   │   ├── resources/          # 图标 / 字体
-│   ├── io/                     # I/O（配置 / Excel / SQLite）
-│   ├── platform/               # 平台集成（Windows 注册表 / 托盘）
-│   ├── integrations/           # 飞书 / Ollama / OpenAI
-│   └── utils/                  # 工具（hash / logger / i18n）
-├── tests/                      # 测试
-├── scripts/                    # 工具脚本（hello world / fixture）
-├── build/                      # 打包配置
-├── docs/                       # 文档
-└── .github/workflows/          # CI
+```bash
+# Lint
+ruff check src/ tests/
+
+# Type check
+mypy src/filemaster
+
+# Coverage
+pytest --cov=src/filemaster --cov-report=html
 ```
 
-## 开发者
-
-- **作者**：ECAS-空气悬架板块-空气悬架合肥工厂-技术开发科
-- **维护**：吴东东
-- **AI 协作**：小龙（aily agent）
+CI 跑通：`.github/workflows/test.yml`（3 OS × 3 Python 测试矩阵）+ `windows-smoke.yml`（Windows 打包冒烟测试）+ `build.yml`（发布 .exe）。
 
 ## 许可证
 
-MIT — 详见 [LICENSE](LICENSE)。
+MIT
