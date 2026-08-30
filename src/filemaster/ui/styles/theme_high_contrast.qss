@@ -1,0 +1,284 @@
+/* ============================================================
+ * FileMaster — 高对比度主题（无障碍 / 视力障碍）
+ * 符合 WCAG AAA 标准（对比度 ≥ 7:1）
+ * ============================================================ */
+
+QWidget {
+    font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 11pt;  /* 略大 */
+    color: #000000;
+    background-color: #FFFFFF;
+}
+
+QMainWindow {
+    background-color: #FFFFFF;
+}
+
+QMenuBar {
+    background-color: #000000;
+    color: #FFFFFF;
+    padding: 4px;
+}
+QMenuBar::item {
+    padding: 8px 16px;
+    background: transparent;
+}
+QMenuBar::item:selected {
+    background-color: #FFFF00;
+    color: #000000;
+}
+
+QMenu {
+    background-color: #FFFFFF;
+    border: 2px solid #000000;
+    color: #000000;
+}
+QMenu::item:selected {
+    background-color: #FFFF00;
+    color: #000000;
+}
+
+QToolBar {
+    background-color: #F0F0F0;
+    border-bottom: 2px solid #000000;
+    spacing: 4px;
+    padding: 4px;
+}
+
+QPushButton {
+    background-color: #FFFFFF;
+    color: #000000;
+    border: 2px solid #000000;
+    border-radius: 0;  /* 直角：更易识别 */
+    padding: 8px 20px;
+    font-weight: 600;
+}
+QPushButton:hover {
+    background-color: #FFFF00;
+    color: #000000;
+}
+QPushButton:pressed {
+    background-color: #000000;
+    color: #FFFFFF;
+}
+QPushButton:disabled {
+    background-color: #E0E0E0;
+    color: #707070;
+    border-color: #707070;
+}
+
+QPushButton[role="primary"] {
+    background-color: #000000;
+    color: #FFFFFF;
+    border: 2px solid #000000;
+    font-weight: 700;
+}
+QPushButton[role="primary"]:hover {
+    background-color: #FFFF00;
+    color: #000000;
+}
+
+QPushButton[role="danger"] {
+    background-color: #FFFFFF;
+    color: #C00000;
+    border: 2px solid #C00000;
+    font-weight: 700;
+}
+QPushButton[role="danger"]:hover {
+    background-color: #C00000;
+    color: #FFFFFF;
+}
+
+QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox {
+    background-color: #FFFFFF;
+    color: #000000;
+    border: 2px solid #000000;
+    border-radius: 0;
+    padding: 6px 10px;
+    selection-background-color: #FFFF00;
+    selection-color: #000000;
+}
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
+    border: 3px solid #0000FF;
+    padding: 5px 9px;
+    background-color: #FFFFE0;
+}
+
+QComboBox {
+    background-color: #FFFFFF;
+    color: #000000;
+    border: 2px solid #000000;
+    border-radius: 0;
+    padding: 6px 24px 6px 10px;
+    min-height: 20px;
+}
+QComboBox:hover {
+    background-color: #FFFF00;
+}
+QComboBox::drop-down {
+    border-left: 2px solid #000000;
+    width: 24px;
+}
+QComboBox::down-arrow {
+    image: none;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 7px solid #000000;
+    margin-right: 8px;
+}
+QComboBox QAbstractItemView {
+    background-color: #FFFFFF;
+    color: #000000;
+    border: 2px solid #000000;
+    selection-background-color: #FFFF00;
+    selection-color: #000000;
+}
+
+QCheckBox {
+    spacing: 10px;
+    background: transparent;
+    color: #000000;
+    font-weight: 600;
+}
+QCheckBox::indicator {
+    width: 20px;
+    height: 20px;
+    border: 2px solid #000000;
+    border-radius: 0;
+    background-color: #FFFFFF;
+}
+QCheckBox::indicator:hover {
+    background-color: #FFFF00;
+}
+QCheckBox::indicator:checked {
+    background-color: #000000;
+    border-color: #000000;
+}
+
+QProgressBar {
+    background-color: #FFFFFF;
+    border: 2px solid #000000;
+    border-radius: 0;
+    text-align: center;
+    color: #000000;
+    font-weight: 700;
+    min-height: 20px;
+}
+QProgressBar::chunk {
+    background-color: #000000;
+    border: none;
+}
+
+QGroupBox {
+    background-color: #FFFFFF;
+    border: 2px solid #000000;
+    border-radius: 0;
+    margin-top: 18px;
+    padding: 14px;
+    font-weight: 700;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 14px;
+    padding: 0 8px;
+    background-color: #FFFFFF;
+    color: #000000;
+}
+
+QListView, QTreeView, QTableView, QTableWidget, QTreeWidget {
+    background-color: #FFFFFF;
+    color: #000000;
+    alternate-background-color: #F5F5F5;
+    border: 2px solid #000000;
+    gridline-color: #000000;
+    selection-background-color: #FFFF00;
+    selection-color: #000000;
+}
+QHeaderView::section {
+    background-color: #000000;
+    color: #FFFFFF;
+    border: none;
+    border-right: 1px solid #FFFFFF;
+    border-bottom: 1px solid #FFFFFF;
+    padding: 8px;
+    font-weight: 700;
+}
+
+QScrollBar:vertical {
+    background: #FFFFFF;
+    width: 16px;
+    border: 1px solid #000000;
+}
+QScrollBar::handle:vertical {
+    background: #000000;
+    border: 2px solid #FFFFFF;
+    min-height: 24px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    background: #FFFFFF;
+    border: 1px solid #000000;
+    height: 16px;
+}
+
+QScrollBar:horizontal {
+    background: #FFFFFF;
+    height: 16px;
+    border: 1px solid #000000;
+}
+QScrollBar::handle:horizontal {
+    background: #000000;
+    border: 2px solid #FFFFFF;
+    min-width: 24px;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    background: #FFFFFF;
+    border: 1px solid #000000;
+    width: 16px;
+}
+
+QStatusBar {
+    background-color: #000000;
+    color: #FFFFFF;
+    border-top: 2px solid #000000;
+    font-weight: 600;
+}
+
+QLabel {
+    background: transparent;
+    color: #000000;
+}
+QLabel[role="header"] {
+    font-size: 18pt;
+    font-weight: 900;
+    color: #000000;
+    padding: 8px 0;
+}
+QLabel[role="muted"] {
+    color: #000000;
+    font-size: 10pt;
+    font-weight: 600;
+}
+
+QTabWidget::pane {
+    border: 2px solid #000000;
+    background-color: #FFFFFF;
+    margin-top: -1px;
+}
+QTabBar::tab {
+    background-color: #FFFFFF;
+    color: #000000;
+    padding: 10px 24px;
+    border: 2px solid #000000;
+    border-bottom: none;
+    font-weight: 600;
+}
+QTabBar::tab:selected {
+    background-color: #000000;
+    color: #FFFFFF;
+    font-weight: 700;
+}
+QTabBar::tab:hover:!selected {
+    background-color: #FFFF00;
+    color: #000000;
+}

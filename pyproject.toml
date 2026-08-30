@@ -1,0 +1,140 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "filemaster"
+version = "0.1.0"
+description = "FileMaster — 文件批量处理工具（重命名 / 分类 / 转换 / 去重 / 归档）"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "ECAS 技术开发科", email = "wudongdong@chinabaolong.net"},
+]
+requires-python = ">=3.10"
+keywords = ["file", "batch", "rename", "classify", "organize", "desktop"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+    "Topic :: System :: Filesystems",
+]
+
+dependencies = [
+    "PySide6>=6.5,<7.0",
+    "openpyxl>=3.1",
+    "PyMuPDF>=1.23",
+    "Pillow>=10.0",
+    "python-docx>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-qt>=4.2",
+    "pytest-cov>=4.1",
+    "black>=23.0",
+    "ruff>=0.1",
+    "mypy>=1.7",
+    "nuitka>=2.0",
+]
+ai = [
+    "ollama>=0.1",
+    "openai>=1.0",
+    "anthropic>=0.18",
+]
+feishu = [
+    "lark-oapi>=1.2",
+]
+build = [
+    "pyinstaller>=6.0",
+    "pyinstaller-hooks-contrib>=2024.1",
+]
+
+[project.scripts]
+filemaster = "filemaster.cli:main"
+filemaster-gui = "filemaster.app:main"
+
+[project.urls]
+Homepage = "https://github.com/bl-filemaster/filemaster"
+Documentation = "https://github.com/bl-filemaster/filemaster/blob/main/docs/"
+Issues = "https://github.com/bl-filemaster/filemaster/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+filemaster = [
+    "ui/styles/*.qss",
+    "ui/resources/icons/*.svg",
+    "ui/resources/fonts/*.ttf",
+]
+
+# --- 测试配置 ----------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "7.4"
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--tb=short",
+    "--cov=filemaster",
+    "--cov-report=term-missing:skip-covered",
+    "--cov-report=html:htmlcov",
+    "--cov-report=xml:coverage.xml",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "gui: marks tests as requiring Qt (use pytest-qt)",
+    "windows: marks tests as Windows-only",
+]
+
+# --- 代码风格 -----------------------------------------------------------
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["E501"]  # black 处理
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # assert 允许
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+files = ["src/filemaster"]
+
+# --- Coverage -----------------------------------------------------------
+[tool.coverage.run]
+source = ["src/filemaster"]
+omit = [
+    "*/tests/*",
+    "*/__main__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

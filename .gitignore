@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+*.whl
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Project
+*.log
+*.bak
+*.tmp
+artifacts/
+!docs/artifacts/.gitkeep
+
+# Generated fixtures
+tests/fixtures/10k_mixed/
+tests/fixtures/temp/
+
+# PyInstaller
+*.spec.bak
+
+# Secrets
+.env
+.env.local
+secrets.json
+
+# OS
+desktop.ini
+$RECYCLE.BIN/
