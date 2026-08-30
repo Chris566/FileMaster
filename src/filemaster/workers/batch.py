@@ -11,11 +11,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, Signal
 
 from filemaster.core.renamer import Renamer, RenameResult
 from filemaster.core.template import Template
-from filemaster.workers.signals import ErrorSignal, ProgressSignal
 
 
 class BatchWorker(QObject):

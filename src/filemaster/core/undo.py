@@ -51,7 +51,7 @@ class UndoEntry:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "UndoEntry":
+    def from_dict(cls, d: dict) -> UndoEntry:
         return cls(
             operation=d["operation"],
             source=Path(d["source"]) if d.get("source") else None,

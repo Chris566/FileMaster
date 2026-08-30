@@ -57,7 +57,7 @@ class Classifier:
     target_root: Path | None = None
 
     @classmethod
-    def from_builtin(cls) -> "Classifier":
+    def from_builtin(cls) -> Classifier:
         """用内置 5 类构造分类器."""
         rules = [
             ClassificationRule(category=cat, extensions=exts)

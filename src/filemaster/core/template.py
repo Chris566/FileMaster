@@ -19,8 +19,8 @@ W2 详细实现：parse / render / validate / 占位符索引文档化。
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 # 简单占位符正则：{Name} 或 {Name:format}
 _PLACEHOLDER_PATTERN = re.compile(r"\{(\w+)(?::([^}]+))?\}")

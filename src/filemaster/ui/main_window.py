@@ -7,11 +7,9 @@ W2-W15 在此基础上扩展。
 from __future__ import annotations
 
 import importlib.resources
-import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QIcon, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,

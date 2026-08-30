@@ -4,11 +4,11 @@
 W2-W4 会在此填实现细节。
 """
 
-from filemaster.core.renamer import Renamer
-from filemaster.core.template import Template
 from filemaster.core.classifier import Classifier
 from filemaster.core.preview import PreviewGenerator
-from filemaster.core.undo import UndoStack, UndoEntry
+from filemaster.core.renamer import Renamer
+from filemaster.core.template import Template
+from filemaster.core.undo import UndoEntry, UndoStack
 
 __all__ = [
     "Renamer",

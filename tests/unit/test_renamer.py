@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from filemaster.core.renamer import RenameResult, Renamer
+from filemaster.core.renamer import Renamer
 from filemaster.core.template import Template
 
 

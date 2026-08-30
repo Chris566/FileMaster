@@ -14,6 +14,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+# Windows 默认 stdout 是 cp936，不能编码中文 print
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    sys.stderr.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+
 # 把 src 加进 sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 

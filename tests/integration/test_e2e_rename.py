@@ -8,7 +8,6 @@ import pytest
 
 from filemaster.core.renamer import Renamer
 from filemaster.core.template import Template
-from filemaster.utils.hash import file_hash
 
 
 @pytest.mark.integration

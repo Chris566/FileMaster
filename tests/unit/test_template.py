@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import pytest
 
-from filemaster.core.template import PlaceholderSpec, Template
+from filemaster.core.template import Template
 
 
 class TestTemplateBasics:

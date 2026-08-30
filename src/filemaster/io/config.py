@@ -43,7 +43,7 @@ class Config:
     extra: dict = field(default_factory=dict)
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "Config":
+    def load(cls, path: Path | None = None) -> Config:
         """从文件加载.
 
         Args:

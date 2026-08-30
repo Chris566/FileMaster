@@ -5,7 +5,6 @@ W1 阶段：构造 tmp 目录、文件工厂、空配置对象。
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
