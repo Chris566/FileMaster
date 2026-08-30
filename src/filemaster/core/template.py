@@ -1,19 +1,29 @@
 """占位符模板引擎.
 
-支持的占位符（持续扩展，W2 详细文档化）：
+支持的占位符（按域分类）：
+
+**基础（W1）**
 - {Prefix}           前缀
 - {OriginalName}    原始文件名（含扩展名）
 - {BaseName}        原始文件名（不含扩展名）
 - {Extension}       扩展名（不含点号）
 - {Index}           序号（默认 1 起）
-- {Index:D3}        补零序号（如 001）
-- {Date}            当前日期（YYYY-MM-DD）
-- {Time}            当前时间（HHmmss）
-- {Title}           PDF/Office 文档标题（W8 落地）
-- {Author}          文档作者（W8 落地）
-- {Regex:pat→repl}  正则替换（W9 落地）
+- {Index:D3}        补零序号（如 001）；支持 D4/D5/D6
+- {Date}            当前日期（YYYY-MM-DD）—— W2 由 renamer 注入
+- {Time}            当前时间（HHmmss）—— W2 由 renamer 注入
 
-W2 详细实现：parse / render / validate / 占位符索引文档化。
+**文件属性（W2 新增）**
+- {FileSize}        人类可读大小，如 "1.5 MB"
+- {FileSizeBytes}   字节数
+- {CreatedDate}     文件创建日期（YYYY-MM-DD）
+- {ModifiedDate}    文件修改日期（YYYY-MM-DD）
+- {HashShort}       文件 md5 前 8 位
+- {Sheet}           Excel 第一个 sheet 名（非 Excel 留空）
+
+**预留（W8/W9）**
+- {Title}           PDF/Office 文档标题
+- {Author}          文档作者
+- {Regex:pat→repl}  正则替换
 """
 
 from __future__ import annotations
@@ -99,11 +109,17 @@ class Template:
         for token in self._tokens:
             if isinstance(token, PlaceholderSpec):
                 value = context.get(token.name, "")
+                # Index 的补零格式化
                 if token.formatter and token.name == "Index":
                     try:
-                        width = int(token.formatter.lstrip("0Dd"))
+                        spec = token.formatter
+                        # 支持 D3/D4/... 与 03/04/... 两种写法
+                        if spec.upper().startswith("D"):
+                            width = int(spec[1:])
+                        else:
+                            width = int(spec.lstrip("0") or "0")
                         value = f"{int(value):0{width}d}"
-                    except ValueError:
+                    except (ValueError, TypeError):
                         pass
                 parts.append(str(value))
             else:
