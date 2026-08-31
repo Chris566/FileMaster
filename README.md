@@ -156,6 +156,32 @@ renamer.apply_with_progress(
 
 **累计**：389 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
 
+### CancellationToken 推广到所有 Worker（W8）— 全 worker 统一取消契约
+
+把 W7 的 `CancellationToken` 模式从 BatchWorker 推广到剩下 3 个 worker，形成**统一的取消契约**：
+
+- **`DedupWorker`**（扫描）：`_cancel_requested: bool` → `_token: CancellationToken`，在 hash 之间检查取消，发 `cancelled(processed)` 信号
+- **`DedupActionWorker`**（move/delete/hardlink）：同样改造，在文件动作之间检查取消
+- **`PreviewWorker`**（单文件预览）：同样改造，但发 `cancelled()` 无参信号（单文件 IO 没有"已处理 N 个"概念）
+
+**`cancelled` 信号契约**：
+- 批处理 worker（BatchWorker / DedupWorker / DedupActionWorker）→ `Signal(int)`（已处理文件数）
+- 单文件 worker（PreviewWorker）→ `Signal()`（无参）
+- 三个 worker 都暴露 `cancellation_token` property 供外部状态查询
+- 三个 worker 的 `cancel()` 内部都调 `self._token.cancel()`
+
+**UI 集成**（`ui/main_window.py`）：
+- `_on_dedup_cancelled(processed_count)` / `_on_dedup_action_cancelled(processed_count)` / `_on_preview_cancelled()`
+- 日志 + 状态栏 + 摘要标签同步刷新 `⏹ 已取消 · 已处理 N 个文件, 剩余未处理`
+- thread 清理统一在 `_on_*_finished` 收尾（避免两个 handler 改同一按钮状态的竞态）
+
+**Tests** — 7 个新单测：
+- DedupWorker 取消（3 个）：cancel_before_run / cancel_during_run（monkey-patch 减速 file_hash）/ token property
+- DedupActionWorker 取消（3 个）：cancel_before_run / cancel_during_run（monkey-patch 减速 _run_single）/ token property
+- PreviewWorker 取消（2 个）：cancel_before_run（emit cancelled() 无参）/ token property
+
+**累计**：405 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
+
 **其他**：
 - **分类器** — 内置 5 类（PDF / WORD / EXCEL / PPT / IMAGE）+ 自定义扩展
 - **元数据** — PDF (PyMuPDF) / Word (python-docx) / Excel (openpyxl) / Image (EXIF)
@@ -220,12 +246,13 @@ python -m filemaster.cli dedup-undo restore --log <log-file>       # 恢复 move
 | **W5** | 重命名收尾 + 4 套 namespace placeholder + CLI 真集成 | ✅ 完成（375 测试） | PDF/Word/Excel/Image 命名空间 · apply_with_progress · 单文件源 |
 | **W6** | BatchWorker 重构 + GUI 进度条升级 + ETA 估算 | ✅ 完成（381 测试） | apply_with_progress 集成 · ETA 滑动窗口 · ✅⚠️⏭❌ 状态图标 · 同步到可见日志面板 |
 | **W7** | apply_with_progress 协作式取消 (CancellationToken) | ✅ 完成（389 测试） | core/cancellation.py · 取消即生效 · cancelled(n) 信号 · undo 只入已处理 |
+| **W8** | CancellationToken 推广到 Dedup / Preview Worker | ✅ 完成（405 测试） | 全 worker 统一取消契约 · 7 个新单测（dedup × 6 + preview × 2 − 1 共享 helper）· monkey-patch 减速模式 |
 | W7-W10 | （Dedup UI 阶段，W4 已超量完成） | ✅ W4 提前覆盖 | — |
 | W11-W13 | 飞书集成 + 右键菜单注册 | 🔜 | |
 | W14-W15 | 打包优化 + 自动更新 | 🔜 | |
 | W16 | v1.0 发布 | 🔜 | |
 
-**当前累计**：389 单测通过 / 0 失败 / 5 跳过 · 跨平台 3 OS × 3 Python CI 全绿 · Windows 全链路冒烟通过。
+**当前累计**：405 单测通过 / 0 失败 / 5 跳过 · 跨平台 3 OS × 3 Python CI 全绿 · Windows 全链路冒烟通过。
 
 ## 16 周路线图
 

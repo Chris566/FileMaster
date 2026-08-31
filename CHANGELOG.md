@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-31
+
+### Added (W8) — CancellationToken 扩展到 Dedup / Preview Worker
+
+把 W7 的 `CancellationToken` 模式从 BatchWorker 推广到所有 Worker（DedupWorker / DedupActionWorker / PreviewWorker），形成**全 worker 统一取消契约**：
+
+- **`workers/dedup.py` — `DedupWorker` + `DedupActionWorker`**：`_cancel_requested: bool` → `_token: CancellationToken`；新增 `cancelled = Signal(int)` 信号（在文件之间检查取消，emit 已处理文件数）；暴露 `cancellation_token` property 供外部状态查询；`cancel()` 改为 `self._token.cancel()`
+- **`workers/preview.py` — `PreviewWorker`**：同上 + `cancelled = Signal()`（无参数 — 单文件 IO 没有"已处理 N 个"概念）
+- **`ui/main_window.py` — 3 个 `_on_*_cancelled` handler**：`_on_dedup_cancelled(processed_count)` / `_on_dedup_action_cancelled(processed_count)` / `_on_preview_cancelled()`，只刷 UI 状态（log + status bar + 摘要标签），thread 清理统一交给 `_on_*_finished`
+
+### Tests (W8)
+
+- **5 个 DedupWorker / DedupActionWorker cancellation 单测**：cancel_before_run / cancel_during_run (用 monkey-patch `file_hash` / `_run_single` 减速)/ cancellation_token_property
+- **2 个 PreviewWorker cancellation 单测**：cancel_before_run / cancellation_token_property
+- 总测试数 **389 → 405**（+16, 5 Windows-only 跳过）
+- **0 ruff lint 警告**（整理 import 顺序）
+
+### Design 决策
+
+- **DedupActionWorker 取消时已处理文件结果保留** — 协作式取消在文件之间检查，已执行的文件动作**不会回滚**（move 已发生、delete 已发生）；这跟 W7 BatchWorker 行为一致
+- **PreviewWorker 用 `Signal()` 无参** — 跟 BatchWorker/DedupWorker 的 `Signal(int)` 区分（语义不同：批处理有"已处理 N 个"，单文件没有）
+- **`*args` 兼容 finished 信号** — DedupWorker emit `Signal(list, object)` (groups, stats) vs DedupActionWorker emit `Signal(object)` (BatchActionResult)，`_DedupSignalRecorder._on_finished(*args)` 自动包成 tuple
+- **monkey-patch 减速模式** — W7 batch 测试用 `file_done.connect(hook)` 触发 cancel，dedup 测试因为 `progressed` 信号只在 `i%10==0` 才发（5 个文件不够），改用 `monkey-patch.setattr(workers.dedup, "file_hash", slow_hash)` 减慢到 50ms/file，再在第 N 次 call 调 cancel
+
 ## [0.7.0] - 2026-08-31
 
 ### Added (W7) — 协作式 cancellation token
