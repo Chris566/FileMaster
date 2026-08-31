@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -31,8 +33,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QProgressDialog,
     QPushButton,
@@ -57,9 +61,13 @@ from filemaster.core.dedup import (
     Deduper,
     DedupStats,
     DuplicateGroup,
+    RestoreResult,
+    UndoLog,
     delete_duplicates,
     hardlink_duplicates,
+    list_undo_logs,
     move_duplicates,
+    restore_undo_log,
 )
 from filemaster.core.preview import FileMetadata, PreviewContent, PreviewKind
 from filemaster.core.renamer import ConflictStrategy
@@ -507,6 +515,12 @@ class MainWindow(QMainWindow):
         self._btn_dedup_hardlink.setToolTip("用硬链替换 duplicates 指向 keeper（Unix 推荐, Windows 可能失败）")
         self._btn_dedup_hardlink.clicked.connect(lambda: self._on_dedup_action("hardlink"))
         h_btn.addWidget(self._btn_dedup_hardlink)
+
+        # W4 v6: 撤销按钮（打开 undo 日志列表对话框）
+        self._btn_dedup_undo = QPushButton("↶ 撤销")
+        self._btn_dedup_undo.setToolTip("查看 ~/.filemaster/undo/ 下的 undo 日志并恢复 move 操作的副本（来自 dedup 动作）")
+        self._btn_dedup_undo.clicked.connect(self._on_dedup_undo)
+        h_btn.addWidget(self._btn_dedup_undo)
 
         h_btn.addStretch(1)
         v_act.addLayout(h_btn)
@@ -1462,6 +1476,40 @@ class MainWindow(QMainWindow):
         self._dedup_action_worker = None
         QMessageBox.warning(self, "动作失败", error)
 
+    # ---------- W4 v6: 撤销（undo log 恢复） ----------
+
+    def _on_dedup_undo(self) -> None:
+        """打开撤销对话框：列 ~/.filemaster/undo/ 下的 undo log, 选一个恢复.
+
+        行为:
+        - 拉 list_undo_logs() 按时间倒序
+        - 选条目 + dry-run/overwrite 选项 → restore_undo_log()
+        - 完成后刷主窗口日志（_log） + 提示对话框
+        - 不启 worker 线程：restore_undo_log 内部走 shutil.move 通常毫秒级
+        """
+        logs = list_undo_logs()
+        if not logs:
+            QMessageBox.information(
+                self,
+                "没有 undo log",
+                "~/.filemaster/undo/ 目录下没有 undo 日志。\n\n"
+                "undo 日志由「移动」和「删除（不进回收站）」动作写入，"
+                "「硬链接」和「移到回收站」不写。",
+            )
+            self._log("↩ undo: 目录为空")
+            return
+
+        # 已经有打开的对话框 → 关掉再开新的（避免 stale 引用）
+        if hasattr(self, "_dedup_undo_dialog") and self._dedup_undo_dialog is not None:
+            import contextlib
+            with contextlib.suppress(RuntimeError):
+                self._dedup_undo_dialog.close()
+            self._dedup_undo_dialog = None
+
+        dlg = DedupUndoDialog(self, logs=logs, log_callback=self._log)
+        self._dedup_undo_dialog = dlg
+        dlg.show()
+
     # ---------- W2：重命名 ----------
 
     def _on_start(self) -> None:
@@ -1644,3 +1692,217 @@ class MainWindow(QMainWindow):
     def _log(self, msg: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
         self._txt_log.append(f"[{stamp}] {msg}")
+
+
+# ============================================================
+# W4 v6: Dedup 撤销对话框
+# ============================================================
+
+
+class DedupUndoDialog(QDialog):
+    """撤销日志列表 + 恢复对话框（W4 v6）.
+
+    设计：
+    - 上半: QListWidget 列所有 undo log（按时间倒序,最新的在前）
+      每行展示: [可恢复?] timestamp action  keeper  entries
+    - 中间: 选项行（dry-run / overwrite）
+    - 按钮: 「🔄 恢复」+「关闭」
+    - 下半: QPlainTextEdit 状态输出（恢复结果/错误）
+
+    不开 worker 线程：restore_undo_log 走 shutil.move 毫秒级,
+    小批量（< 100 文件）同步即可; 大批量可后续切到 worker.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        logs: list[UndoLog],
+        log_callback,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("W4 v6 · 撤销 (Dedup)")
+        self.resize(720, 540)
+        self.setModal(True)
+
+        self._logs = logs
+        self._log_callback = log_callback  # 调主窗口 _log
+
+        # ----- 顶部: undo log 列表 -----
+        self._list = QListWidget()
+        self._list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        for log in logs:
+            flag = "✓" if log.can_restore else "✗"
+            label = (
+                f"{flag}  {log.timestamp}  "
+                f"action={log.action}  "
+                f"entries={log.entry_count}  "
+                f"keeper={log.keeper}"
+            )
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, log)
+            if not log.can_restore:
+                # 不可恢复（delete/trash）灰显 + 提示
+                from PySide6.QtGui import QBrush, QColor
+                item.setForeground(QBrush(QColor("#888")))
+                item.setToolTip(
+                    f"{log.action} 操作不可恢复 (文件已永久删除或已在回收站)"
+                )
+            self._list.addItem(item)
+        # 默认选第一个
+        if self._list.count() > 0:
+            self._list.setCurrentRow(0)
+        self._list.itemSelectionChanged.connect(self._on_selection_changed)
+
+        # ----- 中部: 选项行 -----
+        self._chk_dry = QCheckBox("Dry-run (推荐先开,只看不真动)")
+        self._chk_dry.setChecked(True)
+        self._chk_overwrite = QCheckBox("覆盖已存在的目标")
+        self._chk_overwrite.setChecked(False)
+
+        h_opt = QHBoxLayout()
+        h_opt.addWidget(self._chk_dry)
+        h_opt.addWidget(self._chk_overwrite)
+        h_opt.addStretch(1)
+
+        # ----- 下部: 状态输出 -----
+        self._txt_status = QPlainTextEdit()
+        self._txt_status.setReadOnly(True)
+        self._txt_status.setPlaceholderText("恢复结果会显示在这里…")
+
+        # ----- 按钮 -----
+        self._btn_restore = QPushButton("🔄 恢复")
+        self._btn_restore.clicked.connect(self._on_restore_clicked)
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.accept)
+
+        h_btn = QHBoxLayout()
+        h_btn.addStretch(1)
+        h_btn.addWidget(self._btn_restore)
+        h_btn.addWidget(btn_close)
+
+        # ----- 主布局 -----
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 12, 12, 12)
+        v.setSpacing(8)
+        v.addWidget(QLabel(f"找到 {len(logs)} 个 undo log (按时间倒序):"))
+        v.addWidget(self._list, stretch=2)
+        v.addLayout(h_opt)
+        v.addWidget(QLabel("状态:"))
+        v.addWidget(self._txt_status, stretch=1)
+        v.addLayout(h_btn)
+
+        # 初始状态
+        self._on_selection_changed()
+
+    # ---------- 事件 ----------
+
+    def _on_selection_changed(self) -> None:
+        """选中变更 → 启用/禁用恢复按钮 + 在状态区贴详情."""
+        log = self._current_log()
+        if log is None:
+            self._btn_restore.setEnabled(False)
+            self._txt_status.clear()
+            return
+
+        self._btn_restore.setEnabled(log.can_restore)
+        # 详情显示
+        lines = [
+            f"📄 {log.path.name}",
+            f"  action:    {log.action}",
+            f"  timestamp: {log.timestamp}",
+            f"  group_hash: {log.group_hash[:16]}...",
+            f"  keeper:    {log.keeper}",
+            f"  entries:   {log.entry_count}",
+        ]
+        if log.can_restore:
+            lines.append("  ✓ 可恢复（move 操作, 反向 shutil.move 回原位）")
+        else:
+            lines.append("  ✗ 不可恢复 (delete/trash 不可逆)")
+            lines.append("  💡 提示: 用专业工具 (testdisk/photorec) 或从备份还原")
+        # 列出每个 entry
+        for i, e in enumerate(log.entries[:10], 1):
+            op = e.get("op", "?")
+            if op == "move":
+                lines.append(f"  [{i}] move: {e.get('from', '?')} → {e.get('to', '?')}")
+            else:
+                lines.append(f"  [{i}] {op}: {e.get('path', e.get('from', '?'))}")
+        if len(log.entries) > 10:
+            lines.append(f"  ... 还有 {len(log.entries) - 10} 个 entry")
+        self._txt_status.setPlainText("\n".join(lines))
+
+    def _current_log(self) -> UndoLog | None:
+        item = self._list.currentItem()
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _on_restore_clicked(self) -> None:
+        log = self._current_log()
+        if log is None or not log.can_restore:
+            return
+
+        dry_run = self._chk_dry.isChecked()
+        overwrite = self._chk_overwrite.isChecked()
+        mode = "DRY-RUN" if dry_run else "EXEC"
+
+        # 非 dry-run 二次确认
+        if not dry_run:
+            from PySide6.QtWidgets import QMessageBox
+            reply = QMessageBox.question(
+                self,
+                f"确认恢复 [{mode}]",
+                f"将从 {log.path.name} 恢复 {log.entry_count} 个文件\n\n"
+                f"action: {log.action}\n"
+                f"keeper: {log.keeper}\n\n"
+                f"⚠️ 恢复会把文件从「{log.action} 后的位置」移回「原始位置」\n"
+                f"目标已存在时{'会覆盖' if overwrite else '会跳过'}\n\n"
+                f"确定继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self._append_status(f"[{mode}] 用户取消")
+                return
+
+        # 真正调用 restore_undo_log
+        try:
+            results = restore_undo_log(
+                log.path,
+                overwrite=overwrite,
+                dry_run=dry_run,
+            )
+        except FileNotFoundError as e:
+            self._append_status(f"❌ {e}")
+            self._log_callback(f"↩ undo 失败: {e}")
+            return
+        except ValueError as e:
+            self._append_status(f"❌ {e}")
+            self._log_callback(f"↩ undo 失败: {e}")
+            return
+
+        # 汇总结果
+        success = sum(1 for r in results if r.success)
+        skipped = sum(1 for r in results if r.skipped)
+        failed = sum(1 for r in results if not r.success and not r.skipped)
+
+        self._append_status(
+            f"\n🔄 恢复完成 [{mode}]: 成功 {success} / 跳过 {skipped} / 失败 {failed}"
+        )
+        for r in results:
+            if r.success:
+                tag = "[DRY]" if dry_run else "✓"
+                self._append_status(f"  {tag} {r.source} → {r.target}")
+            elif r.skipped:
+                self._append_status(f"  ⏭️  跳过 {r.source} → {r.target} ({r.error})")
+            else:
+                self._append_status(f"  ✗ {r.source} → {r.target}: {r.error}")
+
+        # 同步刷主窗口日志
+        self._log_callback(
+            f"↩ undo [{mode}] {log.path.name}: "
+            f"成功 {success} / 跳过 {skipped} / 失败 {failed}"
+        )
+
+    def _append_status(self, line: str) -> None:
+        self._txt_status.appendPlainText(line)

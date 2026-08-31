@@ -647,3 +647,274 @@ class TestDedupActionConfirm:
         # 用户点 No → 没起 worker
         assert main_window._dedup_action_thread is None
         assert "shown" in called
+
+
+# ============================================================
+# W4 v6: Dedup Undo GUI 集成
+# ============================================================
+
+
+def _write_undo_log(
+    log_dir: Path,
+    *,
+    ts: str,
+    action: str,
+    entries: list[dict],
+    keeper: str = "/tmp/keeper",
+    group_hash: str = "abc123def456",
+) -> Path:
+    """在 log_dir 写一个 undo log JSON（测试 helper）."""
+    import json as _json
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    p = log_dir / f"{ts}_{group_hash[:8]}_{action}.json"
+    payload = {
+        "action": action,
+        "timestamp": ts,
+        "group_hash": group_hash,
+        "keeper": keeper,
+        "entries": entries,
+    }
+    p.write_text(_json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return p
+
+
+class TestDedupUndoButton:
+    """W4 v6: 工具栏"↶ 撤销"按钮 + 触发逻辑."""
+
+    def test_undo_button_exists(self, main_window) -> None:
+        """撤销按钮在 dedup 动作组里."""
+        assert hasattr(main_window, "_btn_dedup_undo")
+        assert main_window._btn_dedup_undo.text() == "↶ 撤销"
+
+    def test_undo_button_enabled_by_default(self, main_window) -> None:
+        assert main_window._btn_dedup_undo.isEnabled()
+
+    def test_undo_button_clicked_when_no_logs_shows_info(
+        self, main_window, monkeypatch, tmp_path
+    ) -> None:
+        """没 undo log 时点按钮 → 弹 information 不弹窗崩溃."""
+        from PySide6.QtWidgets import QMessageBox
+
+        # monkeypatch main_window 局部导入的 list_undo_logs
+        # (不要 patch dedup_mod 自身的, main_window 顶部 import 的是另一份引用)
+        from filemaster.ui import main_window as mw_mod
+        monkeypatch.setattr(mw_mod, "list_undo_logs", lambda *a, **kw: [])
+
+        called = []
+        monkeypatch.setattr(
+            QMessageBox, "information",
+            lambda *a, **kw: called.append(a) or QMessageBox.StandardButton.Ok,
+        )
+        main_window._btn_dedup_undo.click()
+        # 弹了信息框
+        assert called
+        # 主日志也写了
+        log_text = main_window._txt_log.toPlainText()
+        assert "undo" in log_text.lower() or "↩" in log_text
+
+    def test_undo_button_opens_dialog_with_logs(
+        self, main_window, monkeypatch, tmp_path
+    ) -> None:
+        """有 undo log 时点按钮 → 弹 DedupUndoDialog."""
+        from filemaster.core import dedup as dedup_mod
+        from filemaster.ui import main_window as mw_mod
+        from filemaster.ui.main_window import DedupUndoDialog
+
+        # 造一个 fake UndoLog
+        log_path = _write_undo_log(
+            tmp_path,
+            ts="20260831_120000",
+            action="move",
+            entries=[
+                {"op": "move", "from": str(tmp_path / "moved.txt"), "to": str(tmp_path / "src.txt")},
+            ],
+            keeper=str(tmp_path / "src.txt"),
+        )
+        fake_log = dedup_mod.UndoLog.from_path(log_path)
+        # patch main_window 局部导入的 list_undo_logs
+        monkeypatch.setattr(mw_mod, "list_undo_logs", lambda *a, **kw: [fake_log])
+
+        main_window._btn_dedup_undo.click()
+        # 对话框被创建并显示
+        assert hasattr(main_window, "_dedup_undo_dialog")
+        assert main_window._dedup_undo_dialog is not None
+        assert isinstance(main_window._dedup_undo_dialog, DedupUndoDialog)
+        # 列表里有 1 项
+        assert main_window._dedup_undo_dialog._list.count() == 1
+
+        # 清理
+        main_window._dedup_undo_dialog.close()
+
+
+class TestDedupUndoDialog:
+    """DedupUndoDialog 行为."""
+
+    @pytest.fixture
+    def sample_move_log(self, tmp_path: Path) -> Path:
+        """造 1 个可恢复的 move undo log."""
+        return _write_undo_log(
+            tmp_path,
+            ts="20260831_120000",
+            action="move",
+            entries=[
+                {
+                    "op": "move",
+                    "from": str(tmp_path / "moved1.txt"),
+                    "to": str(tmp_path / "src1.txt"),
+                },
+                {
+                    "op": "move",
+                    "from": str(tmp_path / "moved2.txt"),
+                    "to": str(tmp_path / "src2.txt"),
+                },
+            ],
+            keeper=str(tmp_path / "src1.txt"),
+        )
+
+    @pytest.fixture
+    def sample_delete_log(self, tmp_path: Path) -> Path:
+        """造 1 个不可恢复的 delete undo log."""
+        return _write_undo_log(
+            tmp_path,
+            ts="20260831_130000",
+            action="delete",
+            entries=[
+                {"op": "delete", "path": str(tmp_path / "deleted.txt")},
+            ],
+            keeper=str(tmp_path / "src.txt"),
+        )
+
+    def test_dialog_creation_with_move_log(self, sample_move_log) -> None:
+        from filemaster.core.dedup import UndoLog
+        from filemaster.ui.main_window import DedupUndoDialog
+
+        log = UndoLog.from_path(sample_move_log)
+        dlg = DedupUndoDialog(None, logs=[log], log_callback=lambda m: None)
+        # 默认选第一个
+        assert dlg._list.count() == 1
+        assert dlg._list.currentRow() == 0
+        # 可恢复 → 按钮可用
+        assert dlg._btn_restore.isEnabled()
+        dlg.close()
+
+    def test_dialog_creation_with_delete_log_disables_button(
+        self, sample_delete_log
+    ) -> None:
+        from filemaster.core.dedup import UndoLog
+        from filemaster.ui.main_window import DedupUndoDialog
+
+        log = UndoLog.from_path(sample_delete_log)
+        dlg = DedupUndoDialog(None, logs=[log], log_callback=lambda m: None)
+        # 不可恢复 → 按钮禁用
+        assert not dlg._btn_restore.isEnabled()
+        # 状态区给了提示
+        status = dlg._txt_status.toPlainText()
+        assert "不可恢复" in status
+        dlg.close()
+
+    def test_dialog_default_dryrun_checked(self, sample_move_log) -> None:
+        from filemaster.core.dedup import UndoLog
+        from filemaster.ui.main_window import DedupUndoDialog
+
+        log = UndoLog.from_path(sample_move_log)
+        dlg = DedupUndoDialog(None, logs=[log], log_callback=lambda m: None)
+        assert dlg._chk_dry.isChecked()  # 安全默认
+        assert not dlg._chk_overwrite.isChecked()
+        dlg.close()
+
+    def test_dialog_mixed_logs_marks_can_restore(
+        self, sample_move_log, sample_delete_log
+    ) -> None:
+        """move + delete 混合, move 可点 delete 灰显."""
+        from filemaster.core.dedup import UndoLog
+        from filemaster.ui.main_window import DedupUndoDialog
+
+        log_move = UndoLog.from_path(sample_move_log)
+        log_del = UndoLog.from_path(sample_delete_log)
+        # 顺序: move (新) + delete (更早, 但 list_undo_logs 反序, 这里手动排)
+        dlg = DedupUndoDialog(
+            None, logs=[log_move, log_del], log_callback=lambda m: None
+        )
+        assert dlg._list.count() == 2
+        # 选第 0 (move) → 按钮可用
+        dlg._list.setCurrentRow(0)
+        assert dlg._btn_restore.isEnabled()
+        # 选第 1 (delete) → 按钮禁用
+        dlg._list.setCurrentRow(1)
+        assert not dlg._btn_restore.isEnabled()
+        dlg.close()
+
+    def test_dialog_dryrun_does_not_move_files(
+        self, sample_move_log, tmp_path
+    ) -> None:
+        """dry-run 模式点恢复 → 文件不动, 状态区显示 [DRY] 标记."""
+        from filemaster.core.dedup import UndoLog
+        from filemaster.ui.main_window import DedupUndoDialog
+
+        # 让 entries 里的 from 存在 + to 不存在（dry-run 仍会报"会做什么"）
+        moved1 = tmp_path / "moved1.txt"
+        moved1.write_text("hi")
+        src1 = tmp_path / "src1.txt"
+        # 重写 log entries 用新 path
+        log_path = _write_undo_log(
+            tmp_path,
+            ts="20260831_120000",
+            action="move",
+            entries=[
+                {"op": "move", "from": str(moved1), "to": str(src1)},
+            ],
+        )
+        log = UndoLog.from_path(log_path)
+        dlg = DedupUndoDialog(None, logs=[log], log_callback=lambda m: None)
+        dlg._chk_dry.setChecked(True)  # dry-run
+        dlg._btn_restore.click()
+
+        status = dlg._txt_status.toPlainText()
+        assert "DRY" in status.upper() or "Dry" in status
+        # dry-run 不该动文件
+        assert moved1.exists()
+        assert not src1.exists()
+        dlg.close()
+
+    def test_dialog_real_restore_moves_files_back(self, tmp_path) -> None:
+        """非 dry-run 点恢复 → 文件从 moved 位置回到 src 位置."""
+        from PySide6.QtWidgets import QMessageBox
+
+        from filemaster.core.dedup import UndoLog
+        from filemaster.ui.main_window import DedupUndoDialog
+
+        # 准备：文件在 "moved" 位置（restore 会移回 src）
+        moved = tmp_path / "moved.txt"
+        moved.write_text("hello")
+        src = tmp_path / "src.txt"
+        # src 故意不创建（restore_undo_log 会 mkdir parent）
+
+        log_path = _write_undo_log(
+            tmp_path,
+            ts="20260831_120000",
+            action="move",
+            entries=[{"op": "move", "from": str(moved), "to": str(src)}],
+        )
+        log = UndoLog.from_path(log_path)
+        # 跳过二次确认
+        dlg = DedupUndoDialog(
+            None, logs=[log],
+            log_callback=lambda m: None,
+        )
+        # monkeypatch QMessageBox.question → Yes (不在 dialog 里, 用 patch)
+        orig_q = QMessageBox.question
+        QMessageBox.question = staticmethod(
+            lambda *a, **kw: QMessageBox.StandardButton.Yes
+        )
+        try:
+            dlg._chk_dry.setChecked(False)  # 真恢复
+            dlg._btn_restore.click()
+        finally:
+            QMessageBox.question = orig_q
+
+        # 文件移回 src 位置
+        assert src.exists()
+        assert src.read_text() == "hello"
+        assert not moved.exists()
+        dlg.close()
