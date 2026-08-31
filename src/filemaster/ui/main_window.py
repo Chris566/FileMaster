@@ -1558,6 +1558,7 @@ class MainWindow(QMainWindow):
         self._thread.started.connect(self._worker.run)
         self._worker.progressed.connect(self._on_progress)
         self._worker.file_done.connect(self._on_file_done)
+        self._worker.cancelled.connect(self._on_cancelled)  # W7: 协作式取消信号
         self._worker.failed.connect(self._on_failed)
         self._worker.finished.connect(self._on_finished)
         self._thread.start()
@@ -1604,6 +1605,11 @@ class MainWindow(QMainWindow):
 
     def _on_failed(self, file: str, error: str) -> None:
         self._log(f"失败: {file} - {error}")
+
+    def _on_cancelled(self, processed_count: int) -> None:
+        """W7: 取消信号 — 显示已处理文件数, 让用户知道处理了多少."""
+        self._log(f"⏹ 已取消 · 已处理 {processed_count} 个文件, 剩余未处理")
+        self.statusBar().showMessage(f"已取消 · 已处理 {processed_count} 个文件")
 
     def _on_finished(self, results) -> None:
         total = len(results)

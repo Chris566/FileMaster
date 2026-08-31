@@ -657,3 +657,120 @@ class TestApplyWithProgress:
         assert len(results) == 1
         assert results[0].status == "OK"
         assert (tmp_path / "001_y.txt").exists()
+
+    # ---- apply_with_progress cancellation (W7) ----
+
+    def test_cancellation_stops_loop_immediately(self, tmp_path: Path) -> None:
+        """W7: 取消时立即停止, 已处理的 results 仍返回."""
+        files = []
+        for i in range(5):
+            f = tmp_path / f"f{i}.txt"
+            f.write_text("x")
+            files.append(f)
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+        # 第一个回调后就 cancel
+        cancel_flag = {"cancelled": False}
+
+        def cb(i, total, file, result):
+            cancel_flag["cancelled"] = True
+
+        results = renamer.apply_with_progress(
+            files,
+            on_progress=cb,
+            is_cancelled=lambda: cancel_flag["cancelled"],
+        )
+        # 第 1 个文件处理完 (callback 后 cancel), 循环在第 2 个文件前检查 → 停止
+        assert len(results) == 1
+        assert cancel_flag["cancelled"]
+        assert (tmp_path / "001_f0.txt").exists()
+        # 第 2-5 个文件不应被改名
+        assert not (tmp_path / "002_f1.txt").exists()
+        assert not (tmp_path / "005_f4.txt").exists()
+
+    def test_cancellation_in_middle_of_batch(self, tmp_path: Path) -> None:
+        """W7: 取消发生在第 3 个文件后, 3 个已处理 + 7 个未处理."""
+        files = []
+        for i in range(10):
+            f = tmp_path / f"f{i}.txt"
+            f.write_text("x")
+            files.append(f)
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+        seen = {"n": 0}
+
+        def should_cancel():
+            return seen["n"] >= 3
+
+        def cb(i, total, file, result):
+            seen["n"] = i
+
+        results = renamer.apply_with_progress(
+            files,
+            on_progress=cb,
+            is_cancelled=should_cancel,
+        )
+        assert len(results) == 3
+        # 前 3 个已改名
+        for i in range(3):
+            assert (tmp_path / f"00{i+1}_f{i}.txt").exists()
+        # 后 7 个没改名
+        assert not (tmp_path / "004_f3.txt").exists()
+        assert not (tmp_path / "010_f9.txt").exists()
+
+    def test_cancellation_with_undo_stack_only_processed_entries_pushed(
+        self, tmp_path: Path
+    ) -> None:
+        """W7: undo stack 只含已处理文件的 entries, 取消后未处理文件不入栈."""
+        files = []
+        for i in range(5):
+            f = tmp_path / f"f{i}.txt"
+            f.write_text("x")
+            files.append(f)
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+        seen = {"n": 0}
+
+        def should_cancel():
+            return seen["n"] >= 2
+
+        def cb(i, total, file, result):
+            seen["n"] = i
+
+        undo = UndoStack()
+        results = renamer.apply_with_progress(
+            files,
+            undo_stack=undo,
+            on_progress=cb,
+            is_cancelled=should_cancel,
+        )
+        assert len(results) == 2
+        # undo stack 应只有 2 个 entry (2 个 batch, 每 batch 1 entry)
+        total_entries = sum(len(batch) for batch in undo._entries)  # type: ignore[attr-defined]
+        assert total_entries == 2
+
+    def test_cancellation_already_set_does_no_work(self, tmp_path: Path) -> None:
+        """W7: 取消标记已存在时, 0 个文件被处理."""
+        files = []
+        for i in range(3):
+            f = tmp_path / f"f{i}.txt"
+            f.write_text("x")
+            files.append(f)
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+        results = renamer.apply_with_progress(
+            files,
+            is_cancelled=lambda: True,
+        )
+        assert len(results) == 0
+        for f in files:
+            assert f.exists()  # 原文件不动
+
+    def test_no_cancellation_token_runs_all_files(self, tmp_path: Path) -> None:
+        """W7 backward compat: 不传 is_cancelled 时, 全部文件处理 (W5/W6 行为)."""
+        files = []
+        for i in range(4):
+            f = tmp_path / f"f{i}.txt"
+            f.write_text("x")
+            files.append(f)
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+        results = renamer.apply_with_progress(files)
+        assert len(results) == 4
+        for i in range(4):
+            assert (tmp_path / f"00{i+1}_f{i}.txt").exists()

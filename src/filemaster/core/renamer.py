@@ -456,6 +456,7 @@ class Renamer:
         conflict_strategy: ConflictStrategy = ConflictStrategy.SKIP,
         undo_stack: UndoStack | None = None,
         on_progress: Callable[[int, int, Path, RenameResult], None] | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> list[RenameResult]:
         """W5: apply + 逐文件进度回调.
 
@@ -467,6 +468,9 @@ class Renamer:
             conflict_strategy: 冲突策略
             undo_stack: 可选, 提供则写撤销栈
             on_progress: 回调 (i, total, file, result) -> None
+            is_cancelled: 可选取消回调, 返回 True 时停止处理剩余文件 (W7 协作式取消).
+                          取消发生在文件之间, 不会打断单文件处理. 已收集的
+                          results 仍返回, 已写入的 undo entries 仍入栈.
         Returns:
             RenameResult 列表
         """
@@ -476,6 +480,9 @@ class Renamer:
         entries: list[UndoEntry] = []
 
         for i, file in enumerate(files_list, 1):
+            # W7: 协作式取消 — 在文件之间检查, 不打断单文件
+            if is_cancelled is not None and is_cancelled():
+                break
             result, entry = self._apply_one(file, conflict_strategy, undo_stack)
             results.append(result)
             if entry is not None:
