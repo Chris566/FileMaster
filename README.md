@@ -1,6 +1,6 @@
 # FileMaster
 
-> 跨平台文件批量重命名 + 分类 + 元数据提取工具（Windows/macOS/Linux）
+> 跨平台文件批量重命名 + 分类 + 元数据提取 + 去重 + 撤销 工具（Windows/macOS/Linux）
 > Python 3.10+ · PySide6 6.5+ · 单文件 exe 仅 ~30 MB
 
 ## 主题预览
@@ -13,19 +13,22 @@
 
 ```bash
 # 1. 克隆
-git clone https://github.com/<your-org>/filemaster.git
-cd filemaster
+git clone https://github.com/Chris566/FileMaster
+cd FileMaster
 
 # 2. 安装
 pip install -e ".[dev]"
 
-# 3. 跑测试（确保 66+ 用例全绿）
-pytest --cov=src/filemaster
+# 3. 跑测试（329+ 用例）
+pytest tests/unit/ --cov=src/filemaster
 
 # 4. 启动 GUI
-python scripts/hello_world.py
-# 或
-python scripts/screenshot_themes.py  # 渲染 4 套主题截图到 artifacts/screenshots/
+python -m filemaster
+# 或纯 CLI
+python -m filemaster.cli rename --help
+python -m filemaster.cli dedup-scan --help
+python -m filemaster.cli dedup-action --help
+python -m filemaster.cli dedup-undo --help
 
 # 5. 打包成单文件 exe（无需管理员权限）
 pip install -e ".[build]"
@@ -33,30 +36,78 @@ pyinstaller build/filemaster.spec --clean --noconfirm
 # 产物：dist/filemaster.exe
 ```
 
-## 核心功能（W1 已实现接口）
+## 核心功能
 
-- **重命名引擎** — `{Prefix} {OriginalName} {BaseName} {Extension} {Index:D3} {Date} {Title} {Author}` 占位符
+### 重命名（W1-W2）
+
+- **占位符引擎** — `{Prefix} {OriginalName} {BaseName} {Extension} {Index:D3} {Date} {Title} {Author}`
 - **分类器** — 内置 5 类（PDF / WORD / EXCEL / PPT / IMAGE）+ 自定义扩展
 - **元数据** — PDF (PyMuPDF) / Word (python-docx) / Excel (openpyxl) / Image (EXIF)
-- **去重** — MD5 / SHA1 / SHA256 / BLAKE2b
 - **预览** — 前 N 文件元数据快照
-- **撤销栈** — 50 步环形缓冲 + JSON 持久化
+
+### 去重 Dedup（W3-W4）— 完整闭环
+
+四阶段流水线：扫描 → 预览 → 动作 → 撤销。
+
+```bash
+# 1. 扫描：按哈希分组重复文件
+python -m filemaster.cli dedup-scan <目录> --hash md5
+
+# 2. 预览：看哪几个文件是同组（不实际操作）
+python -m filemaster.cli dedup-scan <目录> --hash sha256 --preview 5
+
+# 3. 执行：选一种动作策略
+python -m filemaster.cli dedup-action <目录> --strategy move_subdir  # 移到 .duplicates/
+python -m filemaster.cli dedup-action <目录> --strategy hardlink     # 硬链接去重
+python -m filemaster.cli dedup-action <目录> --strategy skip         # 跳过重复
+python -m filemaster.cli dedup-action <目录> --strategy delete        # 慎用
+
+# 4. 撤销：每一步动作都写 undo log，事后可恢复
+python -m filemaster.cli dedup-undo list                           # 列出 ~/.filemaster/undo/*.json
+python -m filemaster.cli dedup-undo restore --log <log-file>       # 恢复 move 操作副本
+```
+
+**支持哈希**：`md5` / `sha1` / `sha256` / `blake2b`（按文件大小可任选；SHA256 是平衡速度和碰撞率的推荐值）。
+
+**动作策略**：
+- `skip` — 检测到重复就跳过，不动文件
+- `move_subdir` — 把重复文件移到 `<目录>/.duplicates/`（原文件留原位）
+- `hardlink` — 用硬链接去重，节省磁盘
+- `delete` — 直接删重复文件（**不可撤销**，warn 一行提示）
+
+**撤销栈（Undo）**：
+- 所有 `move` / `hardlink` / `delete` 动作都先写一条 JSON 日志到 `~/.filemaster/undo/<timestamp>.json`
+- 日志含 `op_type` / `timestamp` / `source_path` / `dest_path` / `original_size` / `original_mtime` / `hash_value` / `hash_algo`
+- 损坏的 JSON 自动跳过（list 时不抛错）
+- `restore` 只恢复 `move` 操作（`delete` 没数据可恢复，`hardlink` 撤销会产生临时副本）— 故意不开放 delete 撤销
+
+**GUI 集成**：
+- 主窗口 "去重" 页加 "扫描" → "预览" → "执行" 三个按钮 + 进度条 + 结果列表
+- "↶ 撤销" 按钮（主窗口）打开 `DedupUndoDialog`：QListWidget 列出所有 undo log + 复选框选要恢复的 + 状态输出
+- 10 个 GUI 单测覆盖按钮触发、对话框开关、勾选逻辑、恢复流程（TestDedupUndoButton + TestDedupUndoDialog）
+
+### 其他
+
+- **撤销栈** — 50 步环形缓冲 + JSON 持久化（重命名用，跟 Dedup 撤销是两条独立栈）
 - **Excel 报告** — 7 列 + 冻结表头 + 自动筛选
 - **4 套主题** — light / dark / fluent / high_contrast（QSS）
 - **配置持久化** — 跨平台 `%APPDATA%` / `~/Library` / `$XDG_CONFIG_HOME`
 
 ## 项目状态
 
-| 周次 | 目标 | 状态 |
-|------|------|------|
-| **W1** | 项目脚手架 + 4 主题 + 测试框架 | ✅ 完成（66 测试，3502 行） |
-| W2 | 重命名引擎完整化 + 占位符扩展 | 🔜 |
-| W3-W4 | Excel 导入/导出 + 配置 UI | 🔜 |
-| W5-W6 | 异步任务 + 进度条 | 🔜 |
-| W7-W10 | 元数据提取 + 去重 UI | 🔜 |
-| W11-W13 | 飞书集成 + 右键菜单注册 | 🔜 |
-| W14-W15 | 打包优化 + 自动更新 | 🔜 |
-| W16 | v1.0 发布 | 🔜 |
+| 周次 | 目标 | 状态 | 备注 |
+|------|------|------|------|
+| **W1** | 项目脚手架 + 4 主题 + 测试框架 | ✅ 完成（66 测试） | 主题截图 + PyInstaller spec |
+| **W2** | 重命名引擎 + 6 占位符 + 异步 UI | ✅ 完成 | 异步扫描 + 进度回调 |
+| **W3** | 元数据提取（PDF/Word/Excel/Image） | ✅ 完成（+21 test） | 6 个 placeholder 接入 metadata |
+| **W4** | Dedup 完整闭环（扫描/动作/Undo 恢复+GUI） | ✅ 完成（329 测试） | MD5/SHA1/SHA256/BLAKE2b · 4 动作策略 · GUI 集成 |
+| W5-W6 | 异步任务 + 进度条 | 🔜 | |
+| W7-W10 | （Dedup UI 阶段，W4 已超量完成） | ✅ W4 提前覆盖 | — |
+| W11-W13 | 飞书集成 + 右键菜单注册 | 🔜 | |
+| W14-W15 | 打包优化 + 自动更新 | 🔜 | |
+| W16 | v1.0 发布 | 🔜 | |
+
+**当前累计**：329 单测通过 / 0 失败 / 5 跳过 · 跨平台 3 OS × 3 Python CI 全绿 · Windows 全链路冒烟通过。
 
 ## 16 周路线图
 
@@ -72,7 +123,7 @@ ruff check src/ tests/
 mypy src/filemaster
 
 # Coverage
-pytest --cov=src/filemaster --cov-report=html
+pytest tests/unit/ --cov=src/filemaster --cov-report=html
 ```
 
 CI 跑通：`.github/workflows/test.yml`（3 OS × 3 Python 测试矩阵）+ `windows-smoke.yml`（Windows 打包冒烟测试）+ `build.yml`（发布 .exe）。
