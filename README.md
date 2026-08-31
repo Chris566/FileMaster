@@ -109,6 +109,53 @@ python -m filemaster.cli rename -s <dir> -t "{Index:D3}_{OriginalName}" --dry-ru
 
 **累计**：381 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
 
+### 协作式 cancellation token（W7）— 取消按钮真正生效
+
+**解决 W6 已知局限**：`apply_with_progress` 不响应 `_cancelled` 标志，cancel 按钮只能等当前文件完成。
+
+**CancellationToken**（`core/cancellation.py`）：
+- 状态对象（`is_cancelled` property + `cancel()` 幂等 + `reset()` 复用）
+- 主线程调 `cancel()`，worker 线程读 `is_cancelled`
+- 不绑线程 / 事件循环，可用于 GUI / CLI / 测试任何场景
+
+**`apply_with_progress(is_cancelled)`**（`core/renamer.py`）：
+- 在 for 循环顶部（文件之间）检查 `is_cancelled()`，不打断单文件处理
+- 已收集的 `results` 仍返回，已写入的 `undo entries` 仍入栈
+- **`is_cancelled=None`（默认）= W5/W6 行为完全不变**，backward compat
+
+```python
+from filemaster.core.cancellation import CancellationToken
+from filemaster.core.renamer import Renamer
+
+token = CancellationToken()
+# 主线程: cancel 按钮触发后
+token.cancel()
+# worker 线程: apply_with_progress 内自动检查
+renamer.apply_with_progress(
+    files, on_progress=cb,
+    is_cancelled=token.is_cancelled,  # 注意是 property, 不是方法
+)
+```
+
+**BatchWorker 集成**（`workers/batch.py`）：
+- `_cancelled: bool` → `_token: CancellationToken`（W6 → W7 重构）
+- `cancel()` 内部调 `token.cancel()`
+- `run()` 传 `is_cancelled=lambda: self._token.is_cancelled` 给引擎
+- **新增 `cancelled(int)` 信号**：取消时发已处理文件数（让 UI 知道处理了多少）
+- 暴露 `cancellation_token` property（状态查询 / 测试断言）
+
+**UI 集成**（`ui/main_window.py`）：
+- 接 `cancelled` 信号 → `_on_cancelled(processed_count)` handler
+- 日志面板输出 `⏹ 已取消 · 已处理 N 个文件, 剩余未处理`
+- 状态栏同步显示 `已取消 · 已处理 N 个文件`
+- cancel 按钮在 `_on_finished` 统一重置（避免重复 click 状态机）
+
+**Tests** — 8 个新单测：
+- `apply_with_progress` 取消（5 个）：立即停 / 中段停 / undo 只入已处理 / 预取消 0 处理 / backward compat
+- `BatchWorker` 取消（3 个）：run 中取消触发 cancelled 信号 / 预取消 0 文件 / token property 状态
+
+**累计**：389 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
+
 **其他**：
 - **分类器** — 内置 5 类（PDF / WORD / EXCEL / PPT / IMAGE）+ 自定义扩展
 - **元数据** — PDF (PyMuPDF) / Word (python-docx) / Excel (openpyxl) / Image (EXIF)
@@ -172,12 +219,13 @@ python -m filemaster.cli dedup-undo restore --log <log-file>       # 恢复 move
 | **W4** | Dedup 完整闭环（扫描/动作/Undo 恢复+GUI） | ✅ 完成（329 测试） | MD5/SHA1/SHA256/BLAKE2b · 4 动作策略 · GUI 集成 |
 | **W5** | 重命名收尾 + 4 套 namespace placeholder + CLI 真集成 | ✅ 完成（375 测试） | PDF/Word/Excel/Image 命名空间 · apply_with_progress · 单文件源 |
 | **W6** | BatchWorker 重构 + GUI 进度条升级 + ETA 估算 | ✅ 完成（381 测试） | apply_with_progress 集成 · ETA 滑动窗口 · ✅⚠️⏭❌ 状态图标 · 同步到可见日志面板 |
+| **W7** | apply_with_progress 协作式取消 (CancellationToken) | ✅ 完成（389 测试） | core/cancellation.py · 取消即生效 · cancelled(n) 信号 · undo 只入已处理 |
 | W7-W10 | （Dedup UI 阶段，W4 已超量完成） | ✅ W4 提前覆盖 | — |
 | W11-W13 | 飞书集成 + 右键菜单注册 | 🔜 | |
 | W14-W15 | 打包优化 + 自动更新 | 🔜 | |
 | W16 | v1.0 发布 | 🔜 | |
 
-**当前累计**：381 单测通过 / 0 失败 / 5 跳过 · 跨平台 3 OS × 3 Python CI 全绿 · Windows 全链路冒烟通过。
+**当前累计**：389 单测通过 / 0 失败 / 5 跳过 · 跨平台 3 OS × 3 Python CI 全绿 · Windows 全链路冒烟通过。
 
 ## 16 周路线图
 

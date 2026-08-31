@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-31
+
+### Added (W7) — 协作式 cancellation token
+
+- **`core/cancellation.py` — `CancellationToken`**：协作式取消令牌（状态对象，`is_cancelled` property + `cancel()` 幂等 + `reset()` 复用）
+- **`core/renamer.py` — `apply_with_progress` 加 `is_cancelled: Callable[[], bool] | None = None` 参数**：在文件之间（for 循环顶部）检查取消，不打断单文件。已收集的 `results` 仍返回，已写入的 `undo entries` 仍入栈。**默认 None → 全部文件处理（W5/W6 行为完全不变，backward compat）**
+- **`workers/batch.py` — 集成 `CancellationToken`**：`_cancelled` bool → `_token: CancellationToken`；`cancel()` 内部调 `token.cancel()`；`run()` 传 `is_cancelled=lambda: self._token.is_cancelled` 给引擎
+- **`workers/batch.py` — 新增 `cancelled(int)` 信号**：取消时发已处理文件数，让 UI 知道处理了多少
+- **`workers/batch.py` — 暴露 `cancellation_token` property**：供外部状态查询 / 测试断言
+- **`ui/main_window.py` — 接 `cancelled` 信号**：`_on_cancelled(processed_count)` handler 写日志 `⏹ 已取消 · 已处理 N 个文件, 剩余未处理` + 状态栏同步
+- **Tests** — 8 个新单测（5 renamer cancellation + 3 worker cancellation + 改 1 个过时 W6 限制 docstring）
+  - renamer: 取消立即停 / 中段取消 / undo 只入已处理 / 预取消 0 处理 / backward compat
+  - worker: run 中取消触发 cancelled 信号 / 预取消 0 文件 / token property 状态查询
+- **累计**: 389 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean
+
+### Fixed
+
+- W6 CHANGELOG 标注的已知局限「`apply_with_progress` 不响应 `_cancelled` 标志」已解决 —— cancel 按钮可立即生效，UI 显示已处理文件数
+
 ## [0.6.0] - 2026-08-31
 
 ### Added (W6) — 异步 rename 重构 + GUI 进度条升级
