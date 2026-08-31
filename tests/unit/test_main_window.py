@@ -67,7 +67,8 @@ class TestToolbar:
 
     def test_scan_button_exists(self, main_window) -> None:
         assert hasattr(main_window, "_btn_scan")
-        assert main_window._btn_scan.text() == "📊 预览"
+        # W4 v2 改名: "📊 预览" → "🔄 扫描"（避免与右侧 Preview 面板语义混淆）
+        assert main_window._btn_scan.text() == "🔄 扫描"
 
     def test_window_title_v4(self, main_window) -> None:
         assert "v0.3.0" in main_window.windowTitle()

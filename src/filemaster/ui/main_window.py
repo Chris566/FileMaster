@@ -4,6 +4,8 @@ W1：3 栏布局骨架（配置 / 文件表 / 日志）+ 4 主题切换 + 工具
 W2：重命名引擎真实 IO 接入 + 异步任务 UI（进度条 / 取消）。
 W4 v1：Classifier 集成 — 工具栏加"📁 分类"按钮 + 中间文件表升级 QTableWidget
        加 Category/Confidence 列 + 左侧分类组升级为按类别过滤下拉。
+W4 v2：Preview 面板 — 点击中间表格行时,右侧上方显示元信息+内容预览
+       (文本/图片/PDF/Office/二进制 hex 降级)。
 """
 
 from __future__ import annotations
@@ -12,12 +14,13 @@ import importlib.resources
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread
-from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence
+from PySide6.QtGui import QAction, QBrush, QColor, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -29,6 +32,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QPushButton,
+    QSizePolicy,
+    QStackedWidget,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
@@ -44,12 +49,14 @@ from filemaster.core.classifier import (
     classify_batch,
     classify_file,
 )
+from filemaster.core.preview import FileMetadata, PreviewContent, PreviewKind
 from filemaster.core.renamer import ConflictStrategy
 from filemaster.core.template import Template
 from filemaster.core.undo import UndoStack
 from filemaster.io.config import Config, default_config_dir
 from filemaster.workers.batch import BatchWorker
 from filemaster.workers.classify import ClassifyWorker
+from filemaster.workers.preview import PreviewWorker
 
 # Category 颜色映射（GUI 表格列染色）
 CATEGORY_COLORS: dict[Category, QColor] = {
@@ -104,6 +111,10 @@ class MainWindow(QMainWindow):
         # 当前表格里的所有分类结果（过滤时复用）
         self._all_classifications: list[Classification] = []
 
+        # W4 v2：Preview 线程/Worker（点击中间表格行触发）
+        self._preview_thread: QThread | None = None
+        self._preview_worker: PreviewWorker | None = None
+
         # 构造 UI
         self._build_menu()
         self._build_toolbar()
@@ -115,6 +126,9 @@ class MainWindow(QMainWindow):
 
         # 同步配置到 UI
         self._sync_config_to_ui()
+
+        # W4 v2：把表格的"选中变更"接到 Preview Worker
+        self._table.itemSelectionChanged.connect(self._on_table_selection_changed)
 
     # ---------- 构建 UI ----------
 
@@ -178,8 +192,8 @@ class MainWindow(QMainWindow):
         self._btn_classify.clicked.connect(self._on_classify)
         tb.addWidget(self._btn_classify)
 
-        self._btn_scan = QPushButton("📊 预览")
-        self._btn_scan.setToolTip("扫描源目录并在中间表格预览分类结果")
+        self._btn_scan = QPushButton("🔄 扫描")
+        self._btn_scan.setToolTip("扫描源目录并在中间表格预览分类结果（点击行可在右侧查看文件预览）")
         self._btn_scan.clicked.connect(self._on_load_files_to_table)
         tb.addWidget(self._btn_scan)
 
@@ -375,11 +389,68 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_right_panel(self) -> QWidget:
-        """右侧日志."""
+        """右侧：Preview 元信息 + 内容 + 日志（W4 v2 新增上方预览区）."""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
 
+        # ===== W4 v2：Preview 元信息侧栏 =====
+        gb_meta = QGroupBox("文件元信息（W4 v2）")
+        form = QFormLayout(gb_meta)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self._lbl_meta_name = QLabel("—")
+        self._lbl_meta_size = QLabel("—")
+        self._lbl_meta_mtime = QLabel("—")
+        self._lbl_meta_ctime = QLabel("—")
+        self._lbl_meta_mode = QLabel("—")
+        self._lbl_meta_mime = QLabel("—")
+        form.addRow("文件名:", self._lbl_meta_name)
+        form.addRow("大小:", self._lbl_meta_size)
+        form.addRow("修改时间:", self._lbl_meta_mtime)
+        form.addRow("创建时间:", self._lbl_meta_ctime)
+        form.addRow("权限:", self._lbl_meta_mode)
+        form.addRow("MIME:", self._lbl_meta_mime)
+        layout.addWidget(gb_meta)
+
+        # ===== W4 v2：Preview 内容区（QStackedWidget 按 kind 切换） =====
+        gb_preview = QGroupBox("内容预览")
+        v_prev = QVBoxLayout(gb_preview)
+        self._lbl_preview_kind = QLabel("请先扫描目录,然后在中间表格选中一个文件")
+        self._lbl_preview_kind.setProperty("role", "muted")
+        v_prev.addWidget(self._lbl_preview_kind)
+
+        self._stack_preview = QStackedWidget()
+        # Page 0: 文本（QTextEdit 只读）
+        self._txt_preview_text = QTextEdit()
+        self._txt_preview_text.setReadOnly(True)
+        self._txt_preview_text.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self._stack_preview.addWidget(self._txt_preview_text)
+        # Page 1: 图片（QLabel）
+        self._lbl_preview_image = QLabel()
+        self._lbl_preview_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_preview_image.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self._lbl_preview_image.setStyleSheet("background:#222;color:#888;")
+        self._stack_preview.addWidget(self._lbl_preview_image)
+        # Page 2: 兜底/不支持（QLabel 多行）
+        self._lbl_preview_fallback = QLabel("—")
+        self._lbl_preview_fallback.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._lbl_preview_fallback.setWordWrap(True)
+        self._lbl_preview_fallback.setStyleSheet(
+            "QLabel { background:#1e1e1e; color:#ccc; padding:8px;"
+            " font-family: 'Consolas','Courier New',monospace; }"
+        )
+        self._lbl_preview_fallback.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._stack_preview.addWidget(self._lbl_preview_fallback)
+        v_prev.addWidget(self._stack_preview, stretch=1)
+
+        layout.addWidget(gb_preview, stretch=2)
+
+        # ===== 原有日志区 =====
         gb = QGroupBox("日志")
         v = QVBoxLayout(gb)
         self._txt_log = QTextEdit()
@@ -393,7 +464,7 @@ class MainWindow(QMainWindow):
         h.addWidget(btn_clear)
         v.addLayout(h)
 
-        layout.addWidget(gb)
+        layout.addWidget(gb, stretch=1)
         return panel
 
     def _build_statusbar(self) -> None:
@@ -704,6 +775,159 @@ class MainWindow(QMainWindow):
             n /= 1024
         return f"{n:.1f} PB"
 
+    # ---------- W4 v2：文件预览（点击表格行触发） ----------
+
+    def _on_table_selection_changed(self) -> None:
+        """表格选中行变化 → 启动 PreviewWorker."""
+        # 没有扫描结果时（_refresh_table 还没跑过）也安全：取不到行就 return
+        items = self._table.selectedItems()
+        if not items:
+            return
+        row = items[0].row()
+        # 找到当前选中行对应的原始 Classification（可能被过滤挡掉）
+        # 简化策略：用 _refresh_table 当下填充表格的顺序反推
+        if not self._all_classifications:
+            return
+        selected = (
+            self._cmb_filter.currentText() if hasattr(self, "_cmb_filter") else "全部"
+        )
+        if selected == "全部":
+            rows = self._all_classifications
+        else:
+            try:
+                target_cat = Category(selected)
+                rows = [c for c in self._all_classifications if c.category == target_cat]
+            except ValueError:
+                rows = self._all_classifications
+        if row < 0 or row >= len(rows):
+            return
+        path = rows[row].source
+        self._run_preview_worker(path)
+
+    def _run_preview_worker(self, path: Path) -> None:
+        """异步启动 PreviewWorker（切换行时取消旧 worker）."""
+        # 取消旧 worker（若有）
+        if self._preview_thread is not None and self._preview_thread.isRunning():
+            if self._preview_worker is not None:
+                self._preview_worker.cancel()
+            self._preview_thread.quit()
+            self._preview_thread.wait(1000)
+            self._preview_thread = None
+            self._preview_worker = None
+
+        # 立刻把元信息区填上（同步可取的部分，避免预览 worker 慢时右侧空白）
+        self._update_meta_labels(path)
+
+        # 启动新 worker
+        self._preview_thread = QThread(self)
+        self._preview_worker = PreviewWorker(path)
+        self._preview_worker.moveToThread(self._preview_thread)
+        self._preview_thread.started.connect(self._preview_worker.run)
+        self._preview_worker.succeeded.connect(self._on_preview_succeeded)
+        self._preview_worker.failed.connect(self._on_preview_failed)
+        self._preview_worker.finished.connect(self._on_preview_finished)
+        self._preview_thread.start()
+
+    def _update_meta_labels(self, path: Path) -> None:
+        """同步刷元信息（os.stat 不重, 立即返回）."""
+        try:
+            st = path.stat()
+            self._lbl_meta_name.setText(path.name)
+            self._lbl_meta_size.setText(self._format_size(st.st_size))
+            from datetime import datetime
+            self._lbl_meta_mtime.setText(
+                datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            )
+            self._lbl_meta_ctime.setText(
+                datetime.fromtimestamp(st.st_ctime).strftime("%Y-%m-%d %H:%M:%S")
+            )
+            self._lbl_meta_mode.setText(oct(st.st_mode & 0o777))
+        except OSError as e:
+            for lbl in (
+                self._lbl_meta_name, self._lbl_meta_size,
+                self._lbl_meta_mtime, self._lbl_meta_ctime,
+                self._lbl_meta_mode, self._lbl_meta_mime,
+            ):
+                lbl.setText("—")
+            self._lbl_meta_mime.setText(f"(stat 失败: {e})")
+            return
+        # MIME 由 classify_for_preview 推一个 best-effort
+        from filemaster.core.preview import (
+            _guess_mime,  # type: ignore[attr-defined]
+            classify_for_preview,
+        )
+        self._lbl_meta_mime.setText(_guess_mime(path))
+
+    def _on_preview_succeeded(
+        self, meta: FileMetadata, content: PreviewContent
+    ) -> None:
+        """PreviewWorker 成功 → 把内容刷到右侧 stacked widget."""
+        kind = content.kind
+        # 标题条
+        note = f" ({content.note})" if content.note else ""
+        trunc = " · 已截断" if content.truncated else ""
+        self._lbl_preview_kind.setText(
+            f"类型: {kind.value}{note}{trunc}"
+        )
+
+        if kind == PreviewKind.TEXT and isinstance(content.payload, str):
+            self._txt_preview_text.setPlainText(content.payload)
+            self._stack_preview.setCurrentIndex(0)
+        elif kind == PreviewKind.IMAGE and isinstance(content.payload, QImage):
+            pix = QPixmap.fromImage(content.payload)
+            # 缩放到不超过 stacked widget 尺寸, 保持比例
+            max_w = max(self._stack_preview.width() - 16, 100)
+            max_h = max(self._stack_preview.height() - 16, 100)
+            if not pix.isNull():
+                pix = pix.scaled(
+                    max_w, max_h,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            self._lbl_preview_image.setPixmap(pix)
+            self._stack_preview.setCurrentIndex(1)
+        elif kind == PreviewKind.PDF and isinstance(content.payload, QImage):
+            # PDF 第一页也走 IMAGE 通道
+            pix = QPixmap.fromImage(content.payload)
+            max_w = max(self._stack_preview.width() - 16, 100)
+            max_h = max(self._stack_preview.height() - 16, 100)
+            if not pix.isNull():
+                pix = pix.scaled(
+                    max_w, max_h,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            self._lbl_preview_image.setPixmap(pix)
+            self._stack_preview.setCurrentIndex(1)
+        elif kind in (
+            PreviewKind.OFFICE_DOC,
+            PreviewKind.OFFICE_SHEET,
+            PreviewKind.OFFICE_SLIDE,
+        ) and isinstance(content.payload, str):
+            # Office 渲染的文本片段（行数受限）放文本框
+            self._txt_preview_text.setPlainText(content.payload)
+            self._stack_preview.setCurrentIndex(0)
+        else:
+            # BINARY / UNSUPPORTED / 其它 → fallback label
+            payload = content.payload if isinstance(content.payload, str) else "(无内容)"
+            self._lbl_preview_fallback.setText(payload)
+            self._stack_preview.setCurrentIndex(2)
+
+    def _on_preview_failed(self, path: str, error: str) -> None:
+        """PreviewWorker 失败 → 在 fallback label 显示错误."""
+        self._lbl_preview_kind.setText(f"预览失败: {path}")
+        self._lbl_preview_fallback.setText(f"❌ {error}")
+        self._stack_preview.setCurrentIndex(2)
+        self._log(f"预览失败: {path} - {error}")
+
+    def _on_preview_finished(self) -> None:
+        """PreviewWorker 结束 → 清理 thread 引用."""
+        if self._preview_thread is not None:
+            self._preview_thread.quit()
+            self._preview_thread.wait(2000)
+        self._preview_thread = None
+        self._preview_worker = None
+
     # ---------- W2：重命名 ----------
 
     def _on_start(self) -> None:
@@ -817,6 +1041,11 @@ class MainWindow(QMainWindow):
                 self._classify_worker.cancel()
             self._classify_thread.quit()
             self._classify_thread.wait(2000)
+        if self._preview_thread is not None and self._preview_thread.isRunning():
+            if self._preview_worker is not None:
+                self._preview_worker.cancel()
+            self._preview_thread.quit()
+            self._preview_thread.wait(2000)
         super().closeEvent(event)
 
     # ---------- 撤销 / 关于 ----------
