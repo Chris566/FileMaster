@@ -17,13 +17,30 @@ import sys
 from pathlib import Path
 
 
+def _project_root() -> Path:
+    """从本 test 文件位置向上找含 pyproject.toml 的项目根.
+
+    CI runner（Linux / Windows）和本地开发机都能用——不依赖任何绝对路径。
+    """
+    p = Path(__file__).resolve()
+    for parent in (p, *p.parents):
+        if (parent / "pyproject.toml").is_file():
+            return parent
+    raise RuntimeError(
+        "filemaster 项目根未找到——预期在 tests/unit/ 上方能找到含 pyproject.toml 的目录"
+    )
+
+
+PROJECT_ROOT = _project_root()
+
+
 def _run(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
     """跑 filemaster CLI 同步."""
     return subprocess.run(
         [sys.executable, "-m", "filemaster.cli", *args],
         capture_output=True,
         text=True,
-        cwd=cwd or Path("/home/gem/.aily/workdir/task_7679817958234852530/filemaster"),
+        cwd=cwd or PROJECT_ROOT,
         timeout=30,
     )
 
