@@ -434,9 +434,7 @@ class TestDedupRowSelection:
     def test_row_selection_triggers_preview(
         self, main_window, tmp_path, qtbot
     ) -> None:
-        from PySide6.QtWidgets import QMessageBox
         from filemaster.core.dedup import DuplicateFile, DuplicateGroup
-        monkeypatch_set = None
         # 准备一个 keeper 文件
         p_keeper = tmp_path / "keeper.txt"
         p_keeper.write_text("dup content")
