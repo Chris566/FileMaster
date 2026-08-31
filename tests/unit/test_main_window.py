@@ -280,3 +280,192 @@ class TestRenamerCategoryIntegration:
         renamer = Renamer(template=tpl, prefix="")
         ctx = renamer._context_for(f)
         assert ctx["Category_zh"] == "图片"
+
+
+# ============================================================
+# W4 v3：Dedup 集成
+# ============================================================
+
+
+class TestDedupToolbar:
+    """W4 v3 工具栏：🔍 去重 按钮."""
+
+    def test_dedup_button_exists(self, main_window) -> None:
+        assert hasattr(main_window, "_btn_dedup")
+        assert main_window._btn_dedup.text() == "🔍 去重"
+
+    def test_dedup_button_enabled_by_default(self, main_window) -> None:
+        assert main_window._btn_dedup.isEnabled()
+
+
+class TestDedupTable:
+    """W4 v3 中间面板：去重表 6 列结构."""
+
+    def test_dedup_table_exists(self, main_window) -> None:
+        assert hasattr(main_window, "_table_dedup")
+        assert main_window._table_dedup.columnCount() == 6
+
+    def test_dedup_table_headers(self, main_window) -> None:
+        headers = [
+            main_window._table_dedup.horizontalHeaderItem(i).text()
+            for i in range(main_window._table_dedup.columnCount())
+        ]
+        assert headers == ["#", "Hash(短)", "大小", "文件数", "浪费", "文件列表"]
+
+    def test_dedup_table_starts_empty(self, main_window) -> None:
+        assert main_window._table_dedup.rowCount() == 0
+
+    def test_dedup_summary_label_initially_idle(self, main_window) -> None:
+        assert hasattr(main_window, "_lbl_dedup_summary")
+        assert "未执行" in main_window._lbl_dedup_summary.text() or "去重" in main_window._lbl_dedup_summary.text()
+
+
+class TestCenterStack:
+    """W4 v3 QStackedWidget 切换."""
+
+    def test_center_stack_exists(self, main_window) -> None:
+        assert hasattr(main_window, "_center_stack")
+        # 两个页面: 分类 + 去重
+        assert main_window._center_stack.count() == 2
+
+    def test_default_page_is_classify(self, main_window) -> None:
+        assert main_window._center_stack.currentIndex() == 0
+
+
+class TestDedupHandler:
+    """_on_dedup 入口（不真启动 worker, 只验状态）."""
+
+    def test_dedup_with_no_source_warns(self, main_window, monkeypatch) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: 0)
+
+        main_window._txt_source.setText("")
+        main_window._on_dedup()  # 不应崩溃, 应弹 warning
+        # dedup 按钮没被禁用 (因为根本没启 worker)
+        assert main_window._btn_dedup.isEnabled()
+
+    def test_dedup_with_nonexistent_source_warns(
+        self, main_window, monkeypatch, tmp_path
+    ) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: 0)
+
+        main_window._txt_source.setText(str(tmp_path / "no_such_dir"))
+        main_window._on_dedup()
+        assert main_window._btn_dedup.isEnabled()
+
+    def test_dedup_starts_worker_and_switches_stack(
+        self, main_window, tmp_path, monkeypatch, qtbot
+    ) -> None:
+        """有效源 → 启动 worker, 切到去重表."""
+        from PySide6.QtWidgets import QMessageBox
+        monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: 0)
+        monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: 0)
+
+        # 放几个文件让 worker 跑
+        (tmp_path / "a.txt").write_text("alpha")
+        (tmp_path / "b.txt").write_text("alpha")  # dup
+        (tmp_path / "c.txt").write_text("beta")
+        main_window._txt_source.setText(str(tmp_path))
+
+        main_window._on_dedup()
+        # 切到去重表 (index 1)
+        assert main_window._center_stack.currentIndex() == 1
+        # 启动时 dedup 按钮被禁用
+        assert not main_window._btn_dedup.isEnabled()
+        # 等 worker 跑完
+        qtbot.waitUntil(
+            lambda: main_window._dedup_thread is None, timeout=10000
+        )
+        # 完成后按钮恢复
+        assert main_window._btn_dedup.isEnabled()
+        # 至少 1 组
+        assert main_window._dedup_stats is not None
+        assert main_window._dedup_stats.duplicate_groups >= 1
+        # 表格被填
+        assert main_window._table_dedup.rowCount() >= 1
+
+
+class TestDedupTableRefresh:
+    """_refresh_dedup_table 单元."""
+
+    def test_refresh_with_empty_groups(self, main_window) -> None:
+        main_window._dedup_groups = []
+        main_window._refresh_dedup_table()
+        assert main_window._table_dedup.rowCount() == 0
+
+    def test_refresh_with_groups(self, main_window, tmp_path) -> None:
+        from filemaster.core.dedup import DuplicateFile, DuplicateGroup
+        p1, p2, p3 = [tmp_path / f"f{i}.txt" for i in range(3)]
+        meta = (
+            DuplicateFile(p1, 100, mtime=1.0, ctime=0.0),
+            DuplicateFile(p2, 100, mtime=2.0, ctime=0.0),
+            DuplicateFile(p3, 100, mtime=3.0, ctime=0.0),
+        )
+        g = DuplicateGroup(
+            hash_value="abcdef1234567890" * 4,  # 64 hex
+            algorithm="md5",
+            files=(p1, p2, p3),
+            files_with_meta=meta,
+            hash_size=100,
+            wasted_bytes=200,
+        )
+        main_window._dedup_groups = [g]
+        main_window._refresh_dedup_table()
+        assert main_window._table_dedup.rowCount() == 1
+        # Hash(短) 列: 12 位 + …
+        hash_item = main_window._table_dedup.item(0, 1).text()
+        assert hash_item.startswith("abcdef123456") and "…" in hash_item
+        # 大小
+        assert "100" in main_window._table_dedup.item(0, 2).text()
+        # 文件数
+        assert main_window._table_dedup.item(0, 3).text() == "3"
+        # 浪费
+        assert "200" in main_window._table_dedup.item(0, 4).text()
+        # 文件列表
+        files_text = main_window._table_dedup.item(0, 5).text()
+        assert "f0.txt" in files_text
+        assert "f2.txt" in files_text
+
+
+class TestDedupRowSelection:
+    """点击去重表行 → 联动 Preview 面板."""
+
+    def test_row_selection_triggers_preview(
+        self, main_window, tmp_path, qtbot
+    ) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        from filemaster.core.dedup import DuplicateFile, DuplicateGroup
+        monkeypatch_set = None
+        # 准备一个 keeper 文件
+        p_keeper = tmp_path / "keeper.txt"
+        p_keeper.write_text("dup content")
+        p_dup = tmp_path / "dup.txt"
+        p_dup.write_text("dup content")
+
+        meta = (
+            DuplicateFile(p_keeper, 11, mtime=1.0, ctime=0.0),  # keeper
+            DuplicateFile(p_dup, 11, mtime=2.0, ctime=0.0),
+        )
+        g = DuplicateGroup(
+            hash_value="abc",
+            algorithm="md5",
+            files=(p_keeper, p_dup),
+            files_with_meta=meta,
+            hash_size=11,
+            wasted_bytes=11,
+        )
+        main_window._dedup_groups = [g]
+        main_window._refresh_dedup_table()
+
+        # 选中第 0 行
+        main_window._table_dedup.selectRow(0)
+        qtbot.waitUntil(
+            lambda: main_window._preview_thread is not None, timeout=3000
+        )
+        # 元信息侧栏应被刷成 keeper
+        assert main_window._lbl_meta_name.text() == "keeper.txt"
+        # 等 preview 跑完
+        qtbot.waitUntil(
+            lambda: main_window._preview_thread is None, timeout=5000
+        )

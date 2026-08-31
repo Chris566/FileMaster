@@ -6,11 +6,15 @@ W4 v1：Classifier 集成 — 工具栏加"📁 分类"按钮 + 中间文件表�
        加 Category/Confidence 列 + 左侧分类组升级为按类别过滤下拉。
 W4 v2：Preview 面板 — 点击中间表格行时,右侧上方显示元信息+内容预览
        (文本/图片/PDF/Office/二进制 hex 降级)。
+W4 v3：Dedup 面板 — 工具栏加"🔍 去重"按钮 + 中间 QStackedWidget 切到 Dedup 表
+       6 列(组号/Hash/大小/文件数/浪费/文件列表) + 复用 W4 v2 右侧预览
+       (只查+表格预览, 不动文件; 集成 metadata 在表格里)。
 """
 
 from __future__ import annotations
 
 import importlib.resources
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread
@@ -49,6 +53,7 @@ from filemaster.core.classifier import (
     classify_batch,
     classify_file,
 )
+from filemaster.core.dedup import Deduper, DedupStats, DuplicateGroup
 from filemaster.core.preview import FileMetadata, PreviewContent, PreviewKind
 from filemaster.core.renamer import ConflictStrategy
 from filemaster.core.template import Template
@@ -56,6 +61,7 @@ from filemaster.core.undo import UndoStack
 from filemaster.io.config import Config, default_config_dir
 from filemaster.workers.batch import BatchWorker
 from filemaster.workers.classify import ClassifyWorker
+from filemaster.workers.dedup import DedupWorker
 from filemaster.workers.preview import PreviewWorker
 
 # Category 颜色映射（GUI 表格列染色）
@@ -115,6 +121,12 @@ class MainWindow(QMainWindow):
         self._preview_thread: QThread | None = None
         self._preview_worker: PreviewWorker | None = None
 
+        # W4 v3：Dedup 线程/Worker（去重模式）
+        self._dedup_thread: QThread | None = None
+        self._dedup_worker: DedupWorker | None = None
+        self._dedup_groups: list[DuplicateGroup] = []  # 缓存去重结果
+        self._dedup_stats: DedupStats | None = None  # 缓存统计
+
         # 构造 UI
         self._build_menu()
         self._build_toolbar()
@@ -129,6 +141,12 @@ class MainWindow(QMainWindow):
 
         # W4 v2：把表格的"选中变更"接到 Preview Worker
         self._table.itemSelectionChanged.connect(self._on_table_selection_changed)
+
+        # W4 v3：去重表的"选中变更"接到 Preview Worker（共享同一面板）
+        if hasattr(self, "_table_dedup"):
+            self._table_dedup.itemSelectionChanged.connect(
+                self._on_dedup_table_selection_changed
+            )
 
     # ---------- 构建 UI ----------
 
@@ -196,6 +214,14 @@ class MainWindow(QMainWindow):
         self._btn_scan.setToolTip("扫描源目录并在中间表格预览分类结果（点击行可在右侧查看文件预览）")
         self._btn_scan.clicked.connect(self._on_load_files_to_table)
         tb.addWidget(self._btn_scan)
+
+        tb.addSeparator()
+
+        # W4 v3：去重按钮
+        self._btn_dedup = QPushButton("🔍 去重")
+        self._btn_dedup.setToolTip("按文件 hash 在源目录里找重复文件（只查不动，表格预览）")
+        self._btn_dedup.clicked.connect(self._on_dedup)
+        tb.addWidget(self._btn_dedup)
 
         tb.addSeparator()
 
@@ -360,13 +386,23 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_center_panel(self) -> QWidget:
-        """中间文件表（W4 v1：升级为 QTableWidget）."""
+        """中间面板：W4 v3 改用 QStackedWidget 切两个表.
+
+        - Page 0: 分类预览表 (W4 v1 原始 5 列)
+        - Page 1: 去重结果表 (W4 v3 新增 6 列)
+        工具栏的"🔄 扫描"→ 切到 Page 0；"🔍 去重"→ 切到 Page 1。
+        """
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        gb = QGroupBox("文件预览（实时）— W4：含分类列")
-        v = QVBoxLayout(gb)
+        # QStackedWidget
+        self._center_stack = QStackedWidget()
+        layout.addWidget(self._center_stack)
+
+        # ---- Page 0: 分类预览表 ----
+        gb_classify = QGroupBox("文件预览（实时）— W4：含分类列")
+        v_cls = QVBoxLayout(gb_classify)
 
         # 5 列：# / 文件名 / 大小 / 分类 / 置信度
         self._table = QTableWidget(0, 5)
@@ -378,14 +414,42 @@ class MainWindow(QMainWindow):
         self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        v.addWidget(self._table)
+        v_cls.addWidget(self._table)
 
         # 隐藏旧 QListWidget 兼容（W2 仍可被 _on_file_done 用作日志追加）
         self._list_files = QListWidget()
         self._list_files.setVisible(False)  # 不显示，但保留引用
-        v.addWidget(self._list_files)
+        v_cls.addWidget(self._list_files)
 
-        layout.addWidget(gb)
+        self._center_stack.addWidget(gb_classify)  # index 0
+
+        # ---- Page 1: 去重结果表 (W4 v3) ----
+        gb_dedup = QGroupBox("去重结果（W4 v3）— 按 hash 找出重复文件（只查）")
+        v_dd = QVBoxLayout(gb_dedup)
+
+        # 摘要标签：共 N 组 / 重复 M 个 / 浪费 X GB
+        self._lbl_dedup_summary = QLabel("未执行去重 — 点击工具栏「🔍 去重」按钮")
+        self._lbl_dedup_summary.setProperty("role", "muted")
+        self._lbl_dedup_summary.setWordWrap(True)
+        v_dd.addWidget(self._lbl_dedup_summary)
+
+        # 6 列：# / Hash(短) / 大小 / 文件数 / 浪费 / 文件列表
+        self._table_dedup = QTableWidget(0, 6)
+        self._table_dedup.setHorizontalHeaderLabels([
+            "#", "Hash(短)", "大小", "文件数", "浪费", "文件列表",
+        ])
+        self._table_dedup.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._table_dedup.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._table_dedup.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._table_dedup.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self._table_dedup.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self._table_dedup.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self._table_dedup.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table_dedup.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        v_dd.addWidget(self._table_dedup)
+
+        self._center_stack.addWidget(gb_dedup)  # index 1
+
         return panel
 
     def _build_right_panel(self) -> QWidget:
@@ -704,6 +768,9 @@ class MainWindow(QMainWindow):
         self._all_classifications = classify_batch(files)
         self._refresh_table()
         self._log(f"预览完成: {len(self._all_classifications)} 个文件已分类")
+        # W4 v3：切回分类表
+        if hasattr(self, "_center_stack"):
+            self._center_stack.setCurrentIndex(0)
 
     def _on_filter_category(self, index: int) -> None:
         """过滤下拉变更：刷新表格."""
@@ -928,6 +995,181 @@ class MainWindow(QMainWindow):
         self._preview_thread = None
         self._preview_worker = None
 
+    # ---------- W4 v3：去重（只查 + 表格预览） ----------
+
+    def _on_dedup(self) -> None:
+        """工具栏「🔍 去重」入口：校验 + 启动 DedupWorker."""
+        source = self._txt_source.text().strip()
+        if not source or not Path(source).is_dir():
+            QMessageBox.warning(self, "路径无效", "请先选择有效的源目录")
+            return
+
+        # 切换到去重表
+        if hasattr(self, "_center_stack"):
+            self._center_stack.setCurrentIndex(1)
+
+        recursive = self._chk_classify_recursive.isChecked()
+        self._run_dedup_worker(Path(source), recursive=recursive)
+
+    def _run_dedup_worker(self, source: Path, *, recursive: bool) -> None:
+        """异步启动 DedupWorker（先取消旧 worker）."""
+        # 取消旧 worker
+        if self._dedup_thread is not None and self._dedup_thread.isRunning():
+            if self._dedup_worker is not None:
+                self._dedup_worker.cancel()
+            self._dedup_thread.quit()
+            self._dedup_thread.wait(1000)
+            self._dedup_thread = None
+            self._dedup_worker = None
+
+        # 重置表格 + 摘要
+        self._dedup_groups = []
+        self._dedup_stats = None
+        self._lbl_dedup_summary.setText(f"🔍 正在去重: {source} ...")
+        self._table_dedup.setRowCount(0)
+
+        # 启动新 worker
+        self._dedup_thread = QThread(self)
+        self._dedup_worker = DedupWorker(
+            source=source,
+            algorithm="md5",
+            recursive=recursive,
+        )
+        self._dedup_worker.moveToThread(self._dedup_thread)
+        self._dedup_thread.started.connect(self._dedup_worker.run)
+        self._dedup_worker.progressed.connect(self._on_dedup_progressed)
+        self._dedup_worker.finished.connect(self._on_dedup_finished)
+        self._dedup_worker.failed.connect(self._on_dedup_failed)
+        self._dedup_thread.start()
+
+        # UI 状态
+        self._btn_dedup.setEnabled(False)
+        self._btn_scan.setEnabled(False)
+        self._progress.setValue(0)
+        self._progress.setVisible(True)
+        self._log(f"去重开始: 源={source} 递归={recursive} 算法=md5")
+
+    def _on_dedup_progressed(self, percent: int, message: str) -> None:
+        self._progress.setValue(percent)
+        self.statusBar().showMessage(f"去重: {message}")
+
+    def _on_dedup_finished(
+        self, groups: list, stats: DedupStats
+    ) -> None:
+        """DedupWorker 完成 → 缓存结果 + 刷表 + 提示."""
+        self._dedup_groups = list(groups)
+        self._dedup_stats = stats
+        self._log(
+            f"去重完成: 共 {stats.total_files} 个文件 / "
+            f"{stats.duplicate_groups} 组重复 / "
+            f"{stats.duplicate_files} 个文件可清理 / "
+            f"浪费 {stats.wasted_human} / 耗时 {stats.duration_ms} ms"
+        )
+        self.statusBar().showMessage(
+            f"去重完成 · {stats.duplicate_groups} 组 / 浪费 {stats.wasted_human}"
+        )
+
+        # 刷摘要 + 表格
+        self._lbl_dedup_summary.setText(
+            f"📊 扫描 {stats.total_files} 个文件 · "
+            f"发现 {stats.duplicate_groups} 组重复 · "
+            f"{stats.duplicate_files} 个可清理 · "
+            f"浪费 {stats.wasted_human} · 耗时 {stats.duration_ms} ms"
+        )
+        self._refresh_dedup_table()
+
+        # 进度条收尾
+        self._progress.setVisible(False)
+        self._btn_dedup.setEnabled(True)
+        self._btn_scan.setEnabled(True)
+        if self._dedup_thread is not None:
+            self._dedup_thread.quit()
+            self._dedup_thread.wait(2000)
+        self._dedup_thread = None
+        self._dedup_worker = None
+
+        if stats.duplicate_groups == 0:
+            QMessageBox.information(self, "去重完成", "未发现重复文件 ✓")
+        else:
+            QMessageBox.information(
+                self,
+                "去重完成",
+                f"发现 {stats.duplicate_groups} 组重复文件，"
+                f"共 {stats.duplicate_files} 个可清理，"
+                f"浪费 {stats.wasted_human}。\n\n"
+                f"（W4 v3 范围：只查 + 表格预览，不动文件）",
+            )
+
+    def _on_dedup_failed(self, error: str) -> None:
+        self._log(f"去重失败: {error}")
+        self._lbl_dedup_summary.setText(f"❌ 去重失败: {error}")
+        self._progress.setVisible(False)
+        self._btn_dedup.setEnabled(True)
+        self._btn_scan.setEnabled(True)
+        if self._dedup_thread is not None:
+            self._dedup_thread.quit()
+            self._dedup_thread.wait(2000)
+        self._dedup_thread = None
+        self._dedup_worker = None
+        QMessageBox.warning(self, "去重失败", error)
+
+    def _refresh_dedup_table(self) -> None:
+        """根据 _dedup_groups 刷 6 列表格."""
+        if not hasattr(self, "_table_dedup") or self._table_dedup is None:
+            return
+        self._table_dedup.setRowCount(len(self._dedup_groups))
+        for row_idx, g in enumerate(self._dedup_groups):
+            # 列 0：组号
+            item_idx = QTableWidgetItem(str(row_idx + 1))
+            item_idx.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table_dedup.setItem(row_idx, 0, item_idx)
+
+            # 列 1：Hash（短 12 位 + 提示）
+            hash_short = g.hash_value[:12] if len(g.hash_value) > 12 else g.hash_value
+            item_hash = QTableWidgetItem(f"{hash_short}…")
+            item_hash.setToolTip(f"算法: {g.algorithm}\n完整: {g.hash_value}")
+            item_hash.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table_dedup.setItem(row_idx, 1, item_hash)
+
+            # 列 2：单文件大小
+            item_size = QTableWidgetItem(self._format_size(g.hash_size))
+            item_size.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._table_dedup.setItem(row_idx, 2, item_size)
+
+            # 列 3：文件数
+            item_cnt = QTableWidgetItem(str(g.count))
+            item_cnt.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table_dedup.setItem(row_idx, 3, item_cnt)
+
+            # 列 4：浪费字节
+            item_waste = QTableWidgetItem(
+                self._format_size(g.wasted_bytes) if g.wasted_bytes > 0 else "—"
+            )
+            item_waste.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._table_dedup.setItem(row_idx, 4, item_waste)
+
+            # 列 5：文件列表（路径用 " | " 拼起来）
+            file_strs = [str(p) for p in g.files]
+            item_files = QTableWidgetItem("\n".join(file_strs))
+            item_files.setToolTip("\n".join(file_strs))
+            self._table_dedup.setItem(row_idx, 5, item_files)
+
+    def _on_dedup_table_selection_changed(self) -> None:
+        """去重表行选中 → 联动右侧 Preview 面板（预览组内第一个文件）."""
+        items = self._table_dedup.selectedItems()
+        if not items:
+            return
+        row = items[0].row()
+        if row < 0 or row >= len(self._dedup_groups):
+            return
+        group = self._dedup_groups[row]
+        # 取 keeper（最早 mtime 的）作为预览目标
+        target = group.keeper
+        # 同步刷元信息侧栏
+        self._update_meta_labels(target)
+        # 启动 PreviewWorker
+        self._run_preview_worker(target)
+
     # ---------- W2：重命名 ----------
 
     def _on_start(self) -> None:
@@ -1046,6 +1288,11 @@ class MainWindow(QMainWindow):
                 self._preview_worker.cancel()
             self._preview_thread.quit()
             self._preview_thread.wait(2000)
+        if self._dedup_thread is not None and self._dedup_thread.isRunning():
+            if self._dedup_worker is not None:
+                self._dedup_worker.cancel()
+            self._dedup_thread.quit()
+            self._dedup_thread.wait(2000)
         super().closeEvent(event)
 
     # ---------- 撤销 / 关于 ----------
@@ -1087,7 +1334,9 @@ class MainWindow(QMainWindow):
             f"<h3>FileMaster v0.3.0 (W4)</h3>"
             f"<p>文件批量处理工具</p>"
             f"<p>Python + PySide6 + openpyxl + PyMuPDF</p>"
-            f"<p>W4: Classifier 集成（11 类 + magic bytes）</p>"
+            f"<p>W4 v1: Classifier 集成（11 类 + magic bytes）</p>"
+            f"<p>W4 v2: Preview 面板（文本/图片/PDF/Office/二进制）</p>"
+            f"<p>W4 v3: Dedup 按 hash 去重（只查 + 表格预览）</p>"
             f"<p>配置目录: <code>{cfg_dir}</code></p>"
             f"<p>撤销栈深度: {len(self._undo_stack)}</p>"
             f"<p>© 2026 ECAS 技术开发科 · MIT License</p>",
@@ -1096,6 +1345,5 @@ class MainWindow(QMainWindow):
     # ---------- 工具 ----------
 
     def _log(self, msg: str) -> None:
-        from datetime import datetime
         stamp = datetime.now().strftime("%H:%M:%S")
         self._txt_log.append(f"[{stamp}] {msg}")
