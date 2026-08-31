@@ -16,6 +16,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _project_root() -> Path:
     """从本 test 文件位置向上找含 pyproject.toml 的项目根.
@@ -217,3 +219,115 @@ class TestHelp:
         assert "--json" in r.stdout
         assert "--copy" in r.stdout
         assert "--move" in r.stdout
+
+
+# ============================================================
+# W4 v5: dedup-undo CLI
+# ============================================================
+
+
+class TestDedupUndoCLI:
+    """dedup-undo 子命令 (list + restore) — 走真实 subprocess."""
+
+    def test_dedup_undo_list_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """空目录 → 提示没有, 返 0."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        r = _run("dedup-undo", "list")
+        assert r.returncode == 0
+        assert "没有 undo log" in r.stdout
+
+    def test_dedup_undo_list_with_log(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """有一个 log → 列出."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        undo_dir = tmp_path / ".filemaster" / "undo"
+        undo_dir.mkdir(parents=True)
+        (undo_dir / "20260831_120000_abc12345_move.json").write_text(
+            json.dumps({
+                "action": "move", "timestamp": "t", "group_hash": "abc12345", "keeper": "/k",
+                "entries": [{"op": "move", "from": "/src", "to": "/dst"}],
+            }),
+            encoding="utf-8",
+        )
+        r = _run("dedup-undo", "list")
+        assert r.returncode == 0
+        assert "找到 1 个 undo log" in r.stdout
+        assert "abc12345" in r.stdout
+        assert "可恢复" in r.stdout
+
+    def test_dedup_undo_restore_dry_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """dry-run 模式 → 文件不变."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        work = tmp_path / "work"
+        work.mkdir()
+        keeper = work / "k.txt"
+        keeper.write_text("k")
+        dup = work / "dup" / "k.txt"
+        dup.parent.mkdir()
+        dup.write_text("k")
+        original = work / "original.txt"  # 还没创建
+        log_path = tmp_path / "log.json"
+        log_path.write_text(json.dumps({
+            "action": "move", "timestamp": "t", "group_hash": "h", "keeper": str(keeper),
+            "entries": [{"op": "move", "from": str(dup), "to": str(original)}],
+        }), encoding="utf-8")
+
+        r = _run("dedup-undo", "restore", str(log_path), "--dry-run")
+        assert r.returncode == 0
+        assert "DRY-RUN" in r.stdout
+        # 文件没动
+        assert dup.exists()
+        assert not original.exists()
+
+    def test_dedup_undo_restore_real(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """真恢复 → 文件移回原位."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        work = tmp_path / "work"
+        work.mkdir()
+        keeper = work / "k.txt"
+        keeper.write_text("k")
+        dup = work / "dup" / "k.txt"
+        dup.parent.mkdir()
+        dup.write_text("NEW")
+        original = work / "original.txt"
+        log_path = tmp_path / "log.json"
+        log_path.write_text(json.dumps({
+            "action": "move", "timestamp": "t", "group_hash": "h", "keeper": str(keeper),
+            "entries": [{"op": "move", "from": str(dup), "to": str(original)}],
+        }), encoding="utf-8")
+
+        r = _run("dedup-undo", "restore", str(log_path))
+        assert r.returncode == 0
+        assert original.exists()
+        assert original.read_text() == "NEW"
+        assert not dup.exists()
+
+    def test_dedup_undo_restore_missing_log(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """log 不存在 → 返 1."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        r = _run("dedup-undo", "restore", str(tmp_path / "no_such.json"))
+        assert r.returncode == 1
+        assert "不存在" in r.stdout
+
+    def test_dedup_undo_restore_delete_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """delete action 不可恢复 → 返 1."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        log_path = tmp_path / "log.json"
+        log_path.write_text(json.dumps({
+            "action": "delete", "timestamp": "t", "group_hash": "h", "keeper": "/k",
+            "entries": [{"op": "delete", "path": "/a"}],
+        }), encoding="utf-8")
+        r = _run("dedup-undo", "restore", str(log_path))
+        assert r.returncode == 1
+        assert "不可恢复" in r.stdout

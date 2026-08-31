@@ -440,3 +440,269 @@ class TestIntegration:
             assert keeper.exists()
             for dup in g.duplicates:
                 assert not dup.exists()
+
+
+# ============================================================
+# W4 v5: undo log 恢复
+# ============================================================
+
+
+class TestListUndoLogs:
+    """list_undo_logs() - 列目录里的 undo JSON."""
+
+    def test_empty_dir(self, tmp_path: Path) -> None:
+        from filemaster.core.dedup import list_undo_logs
+        assert list_undo_logs(tmp_path) == []
+
+    def test_nonexistent_dir(self, tmp_path: Path) -> None:
+        from filemaster.core.dedup import list_undo_logs
+        # 不存在不抛, 返空
+        assert list_undo_logs(tmp_path / "no_such_dir") == []
+
+    def test_lists_valid_logs(self, tmp_path: Path) -> None:
+        from filemaster.core.dedup import list_undo_logs
+        # 写 3 个 JSON
+        for i in range(3):
+            (tmp_path / f"2026083{i}_deadbeef_move.json").write_text(
+                json.dumps({
+                    "action": "move",
+                    "timestamp": f"2026083{i}",
+                    "group_hash": f"h{i}",
+                    "keeper": f"/k/{i}",
+                    "entries": [],
+                }),
+                encoding="utf-8",
+            )
+        # 写一个损坏 JSON
+        (tmp_path / "bad.json").write_text("{ not valid", encoding="utf-8")
+        logs = list_undo_logs(tmp_path)
+        assert len(logs) == 3  # 损坏的跳过
+        # 都是 move action
+        assert all(log.action == "move" for log in logs)
+
+    def test_skips_corrupted_json(self, tmp_path: Path) -> None:
+        from filemaster.core.dedup import list_undo_logs
+        (tmp_path / "bad.json").write_text("not json at all", encoding="utf-8")
+        assert list_undo_logs(tmp_path) == []
+
+
+class TestUndoLogDataclass:
+    """W4 v5: UndoLog dataclass + can_restore property."""
+
+    def test_can_restore_move(self, tmp_path: Path) -> None:
+        from filemaster.core.dedup import UndoLog
+        log = UndoLog(
+            path=tmp_path / "x.json",
+            action="move",
+            timestamp="20260831",
+            group_hash="abc",
+            keeper="/k",
+            entries=[{"op": "move", "from": "/a", "to": "/b"}],
+        )
+        assert log.can_restore is True
+        assert log.entry_count == 1
+
+    def test_cannot_restore_delete(self, tmp_path: Path) -> None:
+        from filemaster.core.dedup import UndoLog
+        log = UndoLog(
+            path=tmp_path / "x.json",
+            action="delete",
+            timestamp="20260831",
+            group_hash="abc",
+            keeper="/k",
+            entries=[{"op": "delete", "path": "/a"}],
+        )
+        assert log.can_restore is False
+
+    def test_from_path_roundtrip(self, tmp_path: Path) -> None:
+        from filemaster.core.dedup import UndoLog
+        p = tmp_path / "test.json"
+        p.write_text(json.dumps({
+            "action": "move",
+            "timestamp": "20260831_120000",
+            "group_hash": "abc123",
+            "keeper": "/path/to/keeper.txt",
+            "entries": [
+                {"op": "move", "from": "/a/b.txt", "to": "/c/d.txt"},
+            ],
+        }), encoding="utf-8")
+        log = UndoLog.from_path(p)
+        assert log.action == "move"
+        assert log.timestamp == "20260831_120000"
+        assert log.group_hash == "abc123"
+        assert log.keeper == "/path/to/keeper.txt"
+        assert log.entry_count == 1
+
+
+class TestRestoreUndoLog:
+    """restore_undo_log() - 恢复 move 操作."""
+
+    def test_restore_move_basic(self, tmp_path: Path) -> None:
+        """文件在 _duplicates/, 恢复回原位置."""
+        from filemaster.core.dedup import restore_undo_log
+
+        # 准备: keeper 在 /keeper/a.txt, 副本被移到 /keeper/_duplicates/a.txt
+        keeper_dir = tmp_path / "keeper"
+        keeper_dir.mkdir()
+        keeper = keeper_dir / "a.txt"
+        keeper.write_text("hello")
+        dup_dir = keeper_dir / "_duplicates"
+        dup_dir.mkdir()
+        dup_at_target = dup_dir / "a_copy.txt"
+        dup_at_target.write_text("hello")
+        # 原位文件 a_copy.txt 已被 move 走, 现在不存在
+        original = keeper_dir / "a_copy.txt"
+        assert not original.exists()
+
+        # 写 undo log: from=target (现在位置), to=original (原位)
+        log_path = tmp_path / "undo.json"
+        log_path.write_text(json.dumps({
+            "action": "move",
+            "timestamp": "20260831_120000",
+            "group_hash": "abc",
+            "keeper": str(keeper),
+            "entries": [
+                {"op": "move", "from": str(dup_at_target), "to": str(original)},
+            ],
+        }), encoding="utf-8")
+
+        results = restore_undo_log(log_path)
+        assert len(results) == 1
+        assert results[0].success is True
+        assert results[0].target == original
+        # 文件移回原位
+        assert original.exists()
+        # dup 位置空了
+        assert not dup_at_target.exists()
+
+    def test_restore_dry_run(self, tmp_path: Path) -> None:
+        from filemaster.core.dedup import restore_undo_log
+        keeper = tmp_path / "k.txt"
+        keeper.write_text("k")
+        dup = tmp_path / "_dup" / "k.txt"
+        dup.parent.mkdir()
+        dup.write_text("k")
+        original = tmp_path / "original.txt"
+        log_path = tmp_path / "log.json"
+        log_path.write_text(json.dumps({
+            "action": "move", "timestamp": "t", "group_hash": "h", "keeper": str(keeper),
+            "entries": [{"op": "move", "from": str(dup), "to": str(original)}],
+        }), encoding="utf-8")
+
+        results = restore_undo_log(log_path, dry_run=True)
+        assert len(results) == 1
+        assert results[0].success is True
+        # 文件没动
+        assert dup.exists()
+        assert not original.exists()
+
+    def test_restore_skips_existing_target(self, tmp_path: Path) -> None:
+        """目标已存在 → 默认跳过, 返 success=False, skipped=True."""
+        from filemaster.core.dedup import restore_undo_log
+        keeper = tmp_path / "k.txt"
+        keeper.write_text("k")
+        dup = tmp_path / "dup" / "k.txt"
+        dup.parent.mkdir()
+        dup.write_text("k")
+        original = tmp_path / "original.txt"
+        original.write_text("BLOCKER")  # 占用原位
+        log_path = tmp_path / "log.json"
+        log_path.write_text(json.dumps({
+            "action": "move", "timestamp": "t", "group_hash": "h", "keeper": str(keeper),
+            "entries": [{"op": "move", "from": str(dup), "to": str(original)}],
+        }), encoding="utf-8")
+
+        results = restore_undo_log(log_path)  # overwrite=False
+        assert results[0].success is False
+        assert results[0].skipped is True
+        # 文件没动
+        assert dup.exists()
+
+    def test_restore_overwrite(self, tmp_path: Path) -> None:
+        """overwrite=True 时覆盖目标."""
+        from filemaster.core.dedup import restore_undo_log
+        keeper = tmp_path / "k.txt"
+        keeper.write_text("k")
+        dup = tmp_path / "dup" / "k.txt"
+        dup.parent.mkdir()
+        dup.write_text("NEW")
+        original = tmp_path / "original.txt"
+        original.write_text("OLD")
+        log_path = tmp_path / "log.json"
+        log_path.write_text(json.dumps({
+            "action": "move", "timestamp": "t", "group_hash": "h", "keeper": str(keeper),
+            "entries": [{"op": "move", "from": str(dup), "to": str(original)}],
+        }), encoding="utf-8")
+
+        results = restore_undo_log(log_path, overwrite=True)
+        assert results[0].success is True
+        # original 被覆盖
+        assert original.read_text() == "NEW"
+        assert not dup.exists()
+
+    def test_restore_source_missing(self, tmp_path: Path) -> None:
+        """源 (target) 文件已不存在 → success=False, error 含信息."""
+        from filemaster.core.dedup import restore_undo_log
+        keeper = tmp_path / "k.txt"
+        keeper.write_text("k")
+        original = tmp_path / "original.txt"
+        # dup 已经不在了
+        log_path = tmp_path / "log.json"
+        log_path.write_text(json.dumps({
+            "action": "move", "timestamp": "t", "group_hash": "h", "keeper": str(keeper),
+            "entries": [{"op": "move", "from": "/nonexistent", "to": str(original)}],
+        }), encoding="utf-8")
+
+        results = restore_undo_log(log_path)
+        assert results[0].success is False
+        assert "不存在" in (results[0].error or "")
+
+    def test_restore_delete_action_raises(self, tmp_path: Path) -> None:
+        """delete 操作无法恢复, 抛 ValueError."""
+        from filemaster.core.dedup import restore_undo_log
+        log_path = tmp_path / "log.json"
+        log_path.write_text(json.dumps({
+            "action": "delete", "timestamp": "t", "group_hash": "h", "keeper": "/k",
+            "entries": [{"op": "delete", "path": "/a"}],
+        }), encoding="utf-8")
+        with pytest.raises(ValueError, match="不可恢复"):
+            restore_undo_log(log_path)
+
+    def test_restore_nonexistent_log_raises(self, tmp_path: Path) -> None:
+        from filemaster.core.dedup import restore_undo_log
+        with pytest.raises(FileNotFoundError):
+            restore_undo_log(tmp_path / "no_such.json")
+
+    def test_restore_corrupted_log_raises(self, tmp_path: Path) -> None:
+        from filemaster.core.dedup import restore_undo_log
+        log_path = tmp_path / "bad.json"
+        log_path.write_text("not json", encoding="utf-8")
+        with pytest.raises(json.JSONDecodeError):
+            restore_undo_log(log_path)
+
+    def test_restore_multiple_entries(self, tmp_path: Path) -> None:
+        """多条 entry 一起恢复."""
+        from filemaster.core.dedup import restore_undo_log
+        keeper = tmp_path / "k.txt"
+        keeper.write_text("k")
+        dups = tmp_path / "dups"
+        dups.mkdir()
+        originals = []
+        entries = []
+        for i in range(3):
+            d = dups / f"f{i}.txt"
+            d.write_text(str(i))
+            o = tmp_path / f"orig_{i}.txt"
+            entries.append({"op": "move", "from": str(d), "to": str(o)})
+            originals.append(o)
+        log_path = tmp_path / "log.json"
+        log_path.write_text(json.dumps({
+            "action": "move", "timestamp": "t", "group_hash": "h", "keeper": str(keeper),
+            "entries": entries,
+        }), encoding="utf-8")
+
+        results = restore_undo_log(log_path)
+        assert len(results) == 3
+        assert all(r.success for r in results)
+        for o in originals:
+            assert o.exists()

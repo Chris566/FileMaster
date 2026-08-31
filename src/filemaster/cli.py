@@ -382,6 +382,59 @@ def _cmd_dedup_action(action: str) -> callable:
 # ============================================================
 
 
+def _cmd_dedup_undo_list(args: argparse.Namespace) -> int:
+    """W4 v5: 列出所有 undo log (按时间倒序)."""
+    from filemaster.core.dedup import list_undo_logs
+
+    logs = list_undo_logs()
+    if not logs:
+        print("📂 没有 undo log (默认在 ~/.filemaster/undo/)")
+        return 0
+    print(f"📂 找到 {len(logs)} 个 undo log:\n")
+    for log in logs:
+        flag = "✓ 可恢复" if log.can_restore else "✗ 不可恢复"
+        print(f"  {log.path.name}  {flag}")
+        print(f"    action={log.action}  timestamp={log.timestamp}")
+        print(f"    keeper={log.keeper}")
+        print(f"    entries={log.entry_count}")
+        print()
+    return 0
+
+
+def _cmd_dedup_undo_restore(args: argparse.Namespace) -> int:
+    """W4 v5: 从 undo log 恢复文件 (反向 move)."""
+    from filemaster.core.dedup import restore_undo_log
+
+    log_path = Path(args.log)
+    try:
+        results = restore_undo_log(
+            log_path,
+            overwrite=args.overwrite,
+            dry_run=args.dry_run,
+        )
+    except FileNotFoundError as e:
+        print(f"❌ {e}")
+        return 1
+    except ValueError as e:
+        print(f"❌ {e}")
+        return 1
+
+    mode = "DRY-RUN" if args.dry_run else "EXEC"
+    success = sum(1 for r in results if r.success)
+    skipped = sum(1 for r in results if r.skipped)
+    failed = sum(1 for r in results if not r.success and not r.skipped)
+    print(f"🔄 恢复完成 [{mode}]: 成功 {success} / 跳过 {skipped} / 失败 {failed}\n")
+    for r in results:
+        if r.success:
+            tag = "[DRY]" if args.dry_run else "✓"
+            print(f"  {tag} {r.source} → {r.target}")
+        elif r.skipped:
+            print(f"  ⏭️  跳过 {r.source} → {r.target} ({r.error})")
+        else:
+            print(f"  ✗ {r.source} → {r.target}: {r.error}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造 CLI 参数解析器."""
     parser = argparse.ArgumentParser(
@@ -513,6 +566,32 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true", help="只列将要做什么, 不真改"
     )
     p_dedup_hl.set_defaults(func=_cmd_dedup_action("hardlink"))
+
+    # ----- dedup-undo (W4 v5) -----
+    p_dedup_undo = sub.add_parser(
+        "dedup-undo", help="从 undo log 恢复 move 操作 (W4 v5)"
+    )
+    undo_sub = p_dedup_undo.add_subparsers(
+        dest="undo_action", required=True
+    )
+    p_undo_list = undo_sub.add_parser(
+        "list", help="列出所有 undo log"
+    )
+    p_undo_list.set_defaults(func=_cmd_dedup_undo_list)
+    p_undo_restore = undo_sub.add_parser(
+        "restore", help="从指定 undo log 恢复"
+    )
+    p_undo_restore.add_argument(
+        "log", help="undo log JSON 文件路径 (用 `dedup-undo list` 看)"
+    )
+    p_undo_restore.add_argument(
+        "--overwrite", action="store_true",
+        help="目标已存在时强制覆盖 (默认跳过)"
+    )
+    p_undo_restore.add_argument(
+        "--dry-run", action="store_true", help="只列将要做什么, 不真改"
+    )
+    p_undo_restore.set_defaults(func=_cmd_dedup_undo_restore)
 
     return parser
 

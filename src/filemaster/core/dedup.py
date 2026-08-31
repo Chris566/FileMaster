@@ -642,6 +642,7 @@ def _write_undo_log(
     """写 undo 日志 (move/delete 成功条目).
 
     文件位置: <user_home>/.filemaster/undo/<timestamp>_<hash>_<action>.json
+
     不写: dry_run / 失败 / hardlink
     """
     if dry_run or action == "hardlink" or not entries:
@@ -662,3 +663,175 @@ def _write_undo_log(
         return path
     except OSError:
         return None
+
+# ============================================================
+# W4 v5: undo log 恢复
+# ============================================================
+
+
+@dataclass
+class UndoLog:
+    """W4 v4 写出的 undo log 描述.
+
+    对应 JSON:
+        {
+            "action": "move" | "delete",
+            "timestamp": "20260831_123456",
+            "group_hash": "abc123...",
+            "keeper": "/path/to/keeper",
+            "entries": [
+                {"op": "move", "from": "...", "to": "..."},
+                {"op": "delete" | "trash", "path": "..."},
+                ...
+            ],
+        }
+    """
+
+    path: Path
+    action: str
+    timestamp: str
+    group_hash: str
+    keeper: str
+    entries: list[dict] = field(default_factory=list)
+
+    @property
+    def entry_count(self) -> int:
+        return len(self.entries)
+
+    @property
+    def can_restore(self) -> bool:
+        """只有 move 操作能反移回原位置. delete/trash 是单向的."""
+        return self.action == "move" and all(
+            e.get("op") == "move" for e in self.entries
+        )
+
+    @classmethod
+    def from_path(cls, path: Path) -> UndoLog:
+        """从 JSON 文件读 UndoLog. 损坏抛 ValueError."""
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return cls(
+            path=path,
+            action=data.get("action", "?"),
+            timestamp=data.get("timestamp", ""),
+            group_hash=data.get("group_hash", ""),
+            keeper=data.get("keeper", ""),
+            entries=data.get("entries", []),
+        )
+
+
+@dataclass
+class RestoreResult:
+    """单文件恢复结果."""
+
+    source: Path
+    target: Path
+    success: bool
+    error: str | None = None
+    skipped: bool = False
+
+
+def _undo_log_dir() -> Path:
+    """undo log 默认目录: <home>/.filemaster/undo/."""
+    return Path.home() / ".filemaster" / "undo"
+
+
+def list_undo_logs(log_dir: Path | None = None) -> list[UndoLog]:
+    """列出所有 undo log (按时间倒序, 最新的在前).
+
+    Args:
+        log_dir: 自定义目录, None 时用 ~/.filemaster/undo/
+    Returns:
+        UndoLog 列表; 损坏的 JSON 会被跳过.
+    """
+    d = log_dir or _undo_log_dir()
+    if not d.exists() or not d.is_dir():
+        return []
+    results: list[UndoLog] = []
+    for p in sorted(d.glob("*.json"), reverse=True):
+        try:
+            results.append(UndoLog.from_path(p))
+        except (json.JSONDecodeError, KeyError, OSError, ValueError):
+            continue
+    return results
+
+
+def restore_undo_log(
+    log_path: Path,
+    *,
+    overwrite: bool = False,
+    dry_run: bool = False,
+) -> list[RestoreResult]:
+    """从 undo log JSON 恢复文件 (反向 move 操作).
+
+    Args:
+        log_path: undo log JSON 文件路径
+        overwrite: True 时如果目标已存在则覆盖, False 时跳过
+        dry_run: True 时只报告将要做什么, 不真动
+    Returns:
+        每文件的 RestoreResult
+    Raises:
+        ValueError: undo log 损坏或 action 不支持恢复
+        FileNotFoundError: log_path 不存在
+    """
+    if not log_path.exists():
+        raise FileNotFoundError(f"undo log 不存在: {log_path}")
+    log = UndoLog.from_path(log_path)
+    return _restore_undo_log(log, overwrite=overwrite, dry_run=dry_run)
+
+
+def _restore_undo_log(
+    log: UndoLog,
+    *,
+    overwrite: bool = False,
+    dry_run: bool = False,
+) -> list[RestoreResult]:
+    """实际执行恢复 (UndoLog 内存对象)."""
+    if log.action not in ("move", "delete"):
+        raise ValueError(f"action={log.action} 不支持恢复 (只有 move/delete)")
+    if log.action == "delete":
+        raise ValueError(
+            "delete 操作不可恢复 (文件已永久删除或已在回收站). "
+            "请用专业恢复工具 (testdisk/photorec) 或从备份还原."
+        )
+
+    results: list[RestoreResult] = []
+    for entry in log.entries:
+        op = entry.get("op")
+        if op != "move":
+            continue
+        src = Path(entry["from"])
+        dst = Path(entry["to"])
+
+        if dry_run:
+            results.append(RestoreResult(
+                source=src, target=dst, success=True, skipped=False,
+            ))
+            continue
+
+        if not src.exists():
+            results.append(RestoreResult(
+                source=src, target=dst, success=False,
+                error=f"源文件不存在: {src}",
+            ))
+            continue
+
+        if dst.exists() and not overwrite:
+            results.append(RestoreResult(
+                source=src, target=dst, success=False, skipped=True,
+                error=f"目标已存在: {dst}",
+            ))
+            continue
+
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst))
+            results.append(RestoreResult(
+                source=src, target=dst, success=True,
+            ))
+        except OSError as e:
+            results.append(RestoreResult(
+                source=src, target=dst, success=False,
+                error=str(e),
+            ))
+
+    return results
