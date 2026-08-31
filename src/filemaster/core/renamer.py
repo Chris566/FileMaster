@@ -185,6 +185,33 @@ class Renamer:
         if "Sheet" in used:
             ctx["Sheet"] = get_excel_sheet_name(file)
 
+        # W3: 文档元数据（lazy import — PyMuPDF/Pillow 启动慢）
+        metadata_keys = {"Title", "Author", "Subject", "PageCount", "ImageWidth", "ImageHeight"}
+        if used & metadata_keys:
+            from filemaster.core.metadata import MetadataReader  # noqa: PLC0415
+            try:
+                meta = MetadataReader().read(file)
+                if "Title" in used:
+                    ctx["Title"] = meta.title
+                if "Author" in used:
+                    ctx["Author"] = meta.author
+                if "Subject" in used:
+                    ctx["Subject"] = meta.subject
+                if "PageCount" in used:
+                    ctx["PageCount"] = meta.page_count
+                if "ImageWidth" in used or "ImageHeight" in used:
+                    size = meta.extra.get("size", (0, 0)) if isinstance(meta.extra, dict) else (0, 0)
+                    if "ImageWidth" in used:
+                        ctx["ImageWidth"] = size[0]
+                    if "ImageHeight" in used:
+                        ctx["ImageHeight"] = size[1]
+            except Exception:
+                for k in used & metadata_keys:
+                    if k in ("PageCount", "ImageWidth", "ImageHeight"):
+                        ctx.setdefault(k, 0)
+                    else:
+                        ctx.setdefault(k, "")
+
         return ctx
 
     def _render_target(self, file: Path) -> Path | None:

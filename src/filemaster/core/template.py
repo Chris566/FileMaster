@@ -20,9 +20,15 @@
 - {HashShort}       文件 md5 前 8 位
 - {Sheet}           Excel 第一个 sheet 名（非 Excel 留空）
 
-**预留（W8/W9）**
-- {Title}           PDF/Office 文档标题
-- {Author}          文档作者
+**文档元数据（W3 新增，由 MetadataReader 注入 context）**
+- {Title}           PDF/Word/Excel 文档标题（无则空串）
+- {Author}          文档作者（PDF/Word 直接读；Excel 取 creator；Image 取 EXIF Artist）
+- {Subject}         PDF/Word/Excel 主题/描述
+- {PageCount}       PDF/Word 段落数（Word 简化版 = paragraph 数）
+- {ImageWidth}      图片宽度（像素，非图片返 0）
+- {ImageHeight}     图片高度（像素，非图片返 0）
+
+**预留（W9+）**
 - {Regex:pat→repl}  正则替换
 """
 
