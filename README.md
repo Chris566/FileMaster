@@ -19,7 +19,7 @@ cd FileMaster
 # 2. 安装
 pip install -e ".[dev]"
 
-# 3. 跑测试（375+ 用例）
+# 3. 跑测试（381+ 用例）
 pytest tests/unit/ --cov=src/filemaster
 
 # 4. 启动 GUI
@@ -75,6 +75,39 @@ python -m filemaster.cli rename -s <dir> -t "{Index:D3}_{OriginalName}" --dry-ru
 - 冲突策略：`skip`（目标存在则跳过）/ `overwrite`（覆盖，旧值进 undo 栈）/ `rename_new`（自动加 `(1)` `(2)` ...）
 - 跨平台 atomic overwrite（`os.replace`，Windows 目标存在不抛 FileExistsError）
 - 进度回调异常内部 `contextlib.suppress` 吞掉，不影响主流程
+
+### 异步 rename + GUI 进度条（W6）— 用户感知升级
+
+**BatchWorker 重构**：把 W5 引擎能力 `apply_with_progress(on_progress)` 真正接进 GUI 主流程。
+
+- `workers/batch.py` — `BatchWorker.run()` 用 `apply_with_progress` 替代手动 `apply([single_file])` 循环
+  - 保持 `self._index` 连续性（不破坏现有 undo 栈与 Index 占位符）
+  - 复用 W5 进度回调基础设施（内部 `contextlib.suppress` 吞回调异常）
+- **ETA 估算** — 用前 5 个文件耗时滑动窗口算 ETA，进度消息始终展示 `i/t (pct) ETA Ns`（即使 ETA=0s 仍展示，增强用户进度感）
+- **取消语义局限**（W7+ 解决） — `apply_with_progress` 不响应 `_cancelled` 标志，cancel 按钮只能等当前文件完成
+
+**GUI 进度条升级**（`ui/main_window.py`）：
+- 进度条文本从裸 percent 升级到 `文件名 · 3/10 (30%) ETA 5s`
+- 每文件结果带状态图标写到右侧可见日志面板（之前只写隐藏的 `_list_files`）：
+
+```
+✅ [    OK     ] 001_doc.txt → 001_report.txt
+⚠️ [ CONFLICT ] 002_doc.txt → 002_report.txt  (target exists, skipped)
+⏭ [ SKIPPED  ] 003_doc.txt → 003_report.txt
+❌ [   ERROR  ] 004_doc.txt → read permission denied
+```
+
+- 状态映射：`OK/RENAMED/OVERWRITTEN/DRY_RUN` → ✅ · `CONFLICT` → ⚠️ · `SKIPPED` → ⏭ · 其他 → ❌
+
+**Tests** — 6 个新单测（`tests/unit/test_batch.py`）：
+- `test_basic_run_emits_per_file` — 流式 `file_done` 信号
+- `test_progress_message_has_eta` — 进度消息含 ETA 段
+- `test_empty_files` — 空文件列表不崩
+- `test_with_undo_stack` — UndoStack `deque[list[UndoEntry]]` 正确填充
+- `test_worker_does_not_crash_on_run` — 普通异常不挂
+- `test_failed_handler_does_not_crash` — failed 信号兜底
+
+**累计**：381 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
 
 **其他**：
 - **分类器** — 内置 5 类（PDF / WORD / EXCEL / PPT / IMAGE）+ 自定义扩展
@@ -138,13 +171,13 @@ python -m filemaster.cli dedup-undo restore --log <log-file>       # 恢复 move
 | **W3** | 元数据提取（PDF/Word/Excel/Image） | ✅ 完成（+21 test） | 6 个 placeholder 接入 metadata |
 | **W4** | Dedup 完整闭环（扫描/动作/Undo 恢复+GUI） | ✅ 完成（329 测试） | MD5/SHA1/SHA256/BLAKE2b · 4 动作策略 · GUI 集成 |
 | **W5** | 重命名收尾 + 4 套 namespace placeholder + CLI 真集成 | ✅ 完成（375 测试） | PDF/Word/Excel/Image 命名空间 · apply_with_progress · 单文件源 |
-| W6 | 异步任务 + 进度条（dedup worker 已前置） | 🔜 | |
+| **W6** | BatchWorker 重构 + GUI 进度条升级 + ETA 估算 | ✅ 完成（381 测试） | apply_with_progress 集成 · ETA 滑动窗口 · ✅⚠️⏭❌ 状态图标 · 同步到可见日志面板 |
 | W7-W10 | （Dedup UI 阶段，W4 已超量完成） | ✅ W4 提前覆盖 | — |
 | W11-W13 | 飞书集成 + 右键菜单注册 | 🔜 | |
 | W14-W15 | 打包优化 + 自动更新 | 🔜 | |
 | W16 | v1.0 发布 | 🔜 | |
 
-**当前累计**：375 单测通过 / 0 失败 / 5 跳过 · 跨平台 3 OS × 3 Python CI 全绿 · Windows 全链路冒烟通过。
+**当前累计**：381 单测通过 / 0 失败 / 5 跳过 · 跨平台 3 OS × 3 Python CI 全绿 · Windows 全链路冒烟通过。
 
 ## 16 周路线图
 

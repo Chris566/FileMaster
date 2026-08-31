@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-31
+
+### Added (W6) — 异步 rename 重构 + GUI 进度条升级
+
+- **`workers/batch.py` — `BatchWorker.run()` 重构**：用 W5 `Renamer.apply_with_progress(on_progress)` 替代手动循环 `apply([single_file])`，保持 `self._index` 连续性、复用 W5 进度回调基础设施（内部 `contextlib.suppress` 吞回调异常）
+- **`workers/batch.py` — ETA 估算**：用前 5 个文件耗时滑动窗口算 ETA，进度消息格式 `i/t (pct) ETA Ns` 始终展示（即使 ETA=0s 仍展示，增强用户进度感）
+- **`ui/main_window.py` — 进度条格式升级**：`setFormat(f"{file} · {i}/{t} ({pct}%) ETA {n}s")` 替代裸 percent
+- **`ui/main_window.py` — 每文件结果状态图标**：✅ OK/RENAMED/OVERWRITTEN/DRY_RUN / ⚠️ CONFLICT / ⏭ SKIPPED / ❌ 其他错误
+- **`ui/main_window.py` — 同步到右侧可见日志面板**：每文件结果同时写入 `_txt_log`（之前只写隐藏的 `_list_files`，用户看不到）
+- **Tests** — 6 个新单测（基础流式 file_done / ETA 消息格式 / 空文件 / UndoStack 联动 / worker 不崩溃 / failed 信号兜底）
+- **累计**: 381 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean
+- **已知局限**：`apply_with_progress` 不响应 `_cancelled` 标志，cancel 按钮只能等当前文件完成（W7+ 通过 cancellation token 解决）
+
 ## [0.5.0] - 2026-08-31
 
 ### Added (W5) — 重命名引擎收尾
