@@ -467,3 +467,183 @@ class TestDedupRowSelection:
         qtbot.waitUntil(
             lambda: main_window._preview_thread is None, timeout=5000
         )
+
+
+# ============================================================
+# W4 v4: Dedup 动作 (move/delete/hardlink) GUI 集成测试
+# ============================================================
+
+
+class TestDedupActionButtons:
+    """W4 v4: 3 个动作按钮 + 选项存在."""
+
+    def test_action_buttons_exist(self, main_window) -> None:
+        """3 个动作按钮都建出来."""
+        assert hasattr(main_window, "_btn_dedup_move")
+        assert hasattr(main_window, "_btn_dedup_delete")
+        assert hasattr(main_window, "_btn_dedup_hardlink")
+        assert "移动" in main_window._btn_dedup_move.text()
+        assert "删除" in main_window._btn_dedup_delete.text()
+        assert "硬链" in main_window._btn_dedup_hardlink.text()
+
+    def test_action_buttons_enabled_by_default(self, main_window) -> None:
+        """没在 dedup 任务时, 3 个动作按钮都可点."""
+        assert main_window._btn_dedup_move.isEnabled()
+        assert main_window._btn_dedup_delete.isEnabled()
+        assert main_window._btn_dedup_hardlink.isEnabled()
+
+    def test_dryrun_checked_by_default(self, main_window) -> None:
+        """默认开 dry-run (安全)."""
+        assert main_window._chk_dedup_dryrun.isChecked()
+
+    def test_target_dir_widget_exists(self, main_window) -> None:
+        """目标目录 line edit + 按钮存在."""
+        assert hasattr(main_window, "_txt_dedup_target")
+        assert main_window._txt_dedup_target.text() == ""  # 默认空 → 走默认路径
+
+    def test_overwrite_unchecked_by_default(self, main_window) -> None:
+        """覆盖默认不勾."""
+        assert not main_window._chk_dedup_overwrite.isChecked()
+
+    def test_trash_checked_by_default(self, main_window) -> None:
+        """删时进回收站默认勾上."""
+        assert main_window._chk_dedup_trash.isChecked()
+
+
+class TestGetSelectedDedupGroup:
+    """_get_selected_dedup_group 选行/未选行行为."""
+
+    def test_no_selection_returns_none_and_shows_dialog(
+        self, main_window, monkeypatch
+    ) -> None:
+        """没选行 → 弹窗提示 + 返 None."""
+        from PySide6.QtWidgets import QMessageBox
+
+        called = []
+        monkeypatch.setattr(
+            QMessageBox, "information",
+            lambda *a, **kw: called.append(a) or QMessageBox.StandardButton.Ok,
+        )
+        # 确保没选
+        main_window._table_dedup.clearSelection()
+        result = main_window._get_selected_dedup_group()
+        assert result is None
+        assert called  # 弹了窗
+
+    def test_returns_group_when_selected(self, main_window, tmp_path) -> None:
+        """选了一行 → 返对应 group."""
+        from filemaster.core.dedup import DuplicateFile, DuplicateGroup
+
+        p1 = tmp_path / "a.txt"
+        p1.write_text("hello")
+        p2 = tmp_path / "a_copy.txt"
+        p2.write_text("hello")
+        meta = (
+            DuplicateFile(p1, 5, mtime=1.0, ctime=0.0),
+            DuplicateFile(p2, 5, mtime=2.0, ctime=0.0),
+        )
+        g = DuplicateGroup(
+            hash_value="x", algorithm="md5",
+            files=(p1, p2), files_with_meta=meta, hash_size=5, wasted_bytes=5,
+        )
+        main_window._dedup_groups = [g]
+        main_window._refresh_dedup_table()
+        main_window._table_dedup.selectRow(0)
+        result = main_window._get_selected_dedup_group()
+        assert result is g
+
+
+class TestDedupActionConfirm:
+    """_on_dedup_action 二次确认 + 取消逻辑."""
+
+    def test_dry_run_skips_confirm_dialog(
+        self, main_window, tmp_path, monkeypatch, qtbot
+    ) -> None:
+        """dry-run=True 时不弹确认, 直接起 worker, 完成后弹 information 也 mock 掉."""
+        from PySide6.QtWidgets import QMessageBox
+
+        from filemaster.core.dedup import DuplicateFile, DuplicateGroup
+
+        called = []
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *a, **kw: called.append("question_called") or QMessageBox.StandardButton.Yes,
+        )
+        # 完成后的 QMessageBox.information 也要 mock, 否则测试环境会卡死
+        monkeypatch.setattr(
+            QMessageBox, "information",
+            lambda *a, **kw: called.append("info_called") or QMessageBox.StandardButton.Ok,
+        )
+        # 注入一个 group
+        p1 = tmp_path / "a.txt"
+        p1.write_text("hello")
+        p2 = tmp_path / "a_copy.txt"
+        p2.write_text("hello")
+        meta = (
+            DuplicateFile(p1, 5, mtime=1.0, ctime=0.0),
+            DuplicateFile(p2, 5, mtime=2.0, ctime=0.0),
+        )
+        g = DuplicateGroup(
+            hash_value="x", algorithm="md5",
+            files=(p1, p2), files_with_meta=meta, hash_size=5, wasted_bytes=5,
+        )
+        main_window._dedup_groups = [g]
+        main_window._refresh_dedup_table()
+        main_window._table_dedup.selectRow(0)
+        main_window._chk_dedup_dryrun.setChecked(True)
+
+        # dry-run 跑 move → 走 worker, 不弹 question
+        main_window._on_dedup_action("move")
+        # 关键断言: worker 起来了, 但 question 没被调
+        assert main_window._dedup_action_thread is not None
+        assert "question_called" not in called
+
+        # 等 worker 线程跑完 (dr dry-run 很快)
+        worker_thread = main_window._dedup_action_thread
+        assert worker_thread is not None
+        qtbot.wait_until(
+            lambda: not worker_thread.isRunning(),
+            timeout=5000,
+        )
+
+        # 再 drain 一次事件循环, 让 finished 的 slot 跑完 (调 information)
+        qtbot.wait(200)
+
+        # 确认 information 被调了 (完成弹窗) 且 question 没被调
+        assert "info_called" in called
+        assert "question_called" not in called
+
+    def test_real_action_shows_confirm_dialog(
+        self, main_window, tmp_path, monkeypatch
+    ) -> None:
+        """非 dry-run 时必弹 question, 用户点 No → 不跑."""
+        from PySide6.QtWidgets import QMessageBox
+
+        from filemaster.core.dedup import DuplicateFile, DuplicateGroup
+
+        called = []
+        monkeypatch.setattr(
+            QMessageBox, "question",
+            lambda *a, **kw: called.append("shown") or QMessageBox.StandardButton.No,
+        )
+        p1 = tmp_path / "a.txt"
+        p1.write_text("hello")
+        p2 = tmp_path / "a_copy.txt"
+        p2.write_text("hello")
+        meta = (
+            DuplicateFile(p1, 5, mtime=1.0, ctime=0.0),
+            DuplicateFile(p2, 5, mtime=2.0, ctime=0.0),
+        )
+        g = DuplicateGroup(
+            hash_value="x", algorithm="md5",
+            files=(p1, p2), files_with_meta=meta, hash_size=5, wasted_bytes=5,
+        )
+        main_window._dedup_groups = [g]
+        main_window._refresh_dedup_table()
+        main_window._table_dedup.selectRow(0)
+        main_window._chk_dedup_dryrun.setChecked(False)  # 关键: 关 dry-run
+
+        main_window._on_dedup_action("delete")
+        # 用户点 No → 没起 worker
+        assert main_window._dedup_action_thread is None
+        assert "shown" in called

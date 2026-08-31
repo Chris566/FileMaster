@@ -1,12 +1,28 @@
-"""文件去重（W4 v3：找重复 + metadata 集成）.
+"""文件去重（W4 v4：只查 + 移动/删除/硬链接）.
 
-按 MD5 / SHA1 / SHA256 / BLAKE2B 哈希分组，重复文件展示在 GUI 表格里。
-W4 v3 范围：**只查 + 表格预览**，不做移动/删除/硬链接（用户拍板）。
-metadata 集成：每个 DuplicateGroup 带 hash_size + files_with_meta（path/size/mtime/ctime）。
+按 MD5 / SHA1 / SHA256 / BLAKE2B 哈希分组,重复文件展示在 GUI 表格里。
+
+W4 v3 范围：只查 + 表格预览 (W4 v3)。
+W4 v4 范围(本版)：
+  - 3 个动作函数：move_duplicates / delete_duplicates / hardlink_duplicates
+  - 每文件粒度错误隔离（一个失败不阻塞整批）
+  - dry-run 支持（只列将要做什么, 不真动）
+  - 跨平台兼容：Windows 硬链 / 跨设备移动 / 权限错 都有明确报错
+  - undo log（move/delete 写 JSON, hardlink 不写因为无数据丢失）
+
+API 设计原则：
+  - 同步函数, 全部接收 DuplicateGroup 返回 ActionResult
+  - 异步执行由 DedupActionWorker 包装
+  - dry_run=True 时所有函数只返回"将要做什么",不调用 shutil/os.remove
 """
 
 from __future__ import annotations
 
+import json
+import os
+import platform
+import shutil
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -105,13 +121,14 @@ class DedupStats:
 
 @dataclass
 class Deduper:
-    """去重器（W4 v3：增强 metadata 集成）.
+    """去重器（W4 v4：只查 + 3 动作函数入口）.
 
     设计原则：
-    - **只查**: 不动文件，输出 DuplicateGroup 给上层消费
+    - **只查**: 不动文件, 输出 DuplicateGroup 给上层消费
     - **向后兼容**: W2 时代的 find_duplicates() / get_stats() 保留行为
     - **metadata 优先**: find_duplicates_with_meta() 是 W4 v3 主推 API
     - **跨平台**: _stat_safe() 兜底 os.stat 失败（文件被删/权限错）
+    - **3 动作走模块函数**: move/delete/hardlink 不放这里, 见模块末尾
     """
 
     algorithm: str = "md5"  # md5 | sha1 | sha256 | blake2b
@@ -237,6 +254,363 @@ class Deduper:
         return groups, stats
 
 
+# ----- W4 v4：3 个动作函数 + ActionResult -----
+
+
+@dataclass
+class ActionResult:
+    """单文件动作结果.
+
+    Attributes:
+        source: 动作执行的文件原路径
+        target: 动作后的文件路径（move 后 / hardlink 后 / delete 后为 None）
+        action: 动作名 ("move" | "delete" | "hardlink")
+        success: 是否成功
+        error: 失败时的错误信息, 成功时为 None
+        dry_run: True 表示只看了没真动
+    """
+
+    source: Path
+    target: Path | None
+    action: str
+    success: bool
+    error: str | None = None
+    dry_run: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "source": str(self.source),
+            "target": str(self.target) if self.target else None,
+            "action": self.action,
+            "success": self.success,
+            "error": self.error,
+            "dry_run": self.dry_run,
+        }
+
+
+@dataclass
+class BatchActionResult:
+    """一组动作的批结果.
+
+    Attributes:
+        group: 该批对应的 DuplicateGroup
+        action: 动作名
+        dry_run: True 表示只看了没真动
+        results: 每文件的 ActionResult
+        undo_log_path: 写出的 undo 日志路径（move/delete 才有, hardlink 是 None）
+    """
+
+    group: DuplicateGroup
+    action: str
+    dry_run: bool
+    results: list[ActionResult] = field(default_factory=list)
+    undo_log_path: Path | None = None
+
+    @property
+    def success_count(self) -> int:
+        return sum(1 for r in self.results if r.success)
+
+    @property
+    def fail_count(self) -> int:
+        return sum(1 for r in self.results if not r.success)
+
+    @property
+    def saved_bytes(self) -> int:
+        """动作实际节省的字节数（= 成功处理的 duplicate 文件 × hash_size）."""
+        return self.group.hash_size * self.success_count
+
+
+# ----- move -----
+
+
+def move_duplicates(
+    group: DuplicateGroup,
+    target_dir: Path | None = None,
+    *,
+    dry_run: bool = False,
+    overwrite: bool = False,
+) -> BatchActionResult:
+    """把 group.duplicates 移到 target_dir.
+
+    Args:
+        group: 重复组
+        target_dir: 目标目录, None 时用 group.duplicates[0].parent / _duplicates
+        dry_run: True 时只列将要做什么, 不真动
+        overwrite: True 时已存在的目标文件会被覆盖, False 时同名跳过
+    Returns:
+        BatchActionResult
+    """
+    if target_dir is None:
+        # 默认: keeper 所在目录的 _duplicates/ 子目录
+        target_dir = group.keeper.parent / "_duplicates"
+
+    results: list[ActionResult] = []
+    undo_entries: list[dict] = []
+
+    if not dry_run:
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            # 整个批失败：每个文件都返同样错
+            return BatchActionResult(
+                group=group,
+                action="move",
+                dry_run=False,
+                results=[
+                    ActionResult(
+                        source=src,
+                        target=None,
+                        action="move",
+                        success=False,
+                        error=f"无法创建目标目录 {target_dir}: {e}",
+                        dry_run=False,
+                    )
+                    for src in group.duplicates
+                ],
+            )
+
+    for src in group.duplicates:
+        target = target_dir / src.name
+        if dry_run:
+            results.append(ActionResult(
+                source=src,
+                target=target,
+                action="move",
+                success=True,
+                dry_run=True,
+            ))
+            continue
+
+        # 目标已存在且不覆盖 → 跳过
+        if target.exists() and not overwrite:
+            results.append(ActionResult(
+                source=src,
+                target=target,
+                action="move",
+                success=False,
+                error=f"目标已存在: {target}",
+                dry_run=False,
+            ))
+            continue
+
+        # 同一文件 → 跳过（不需要移）
+        try:
+            if src.resolve() == target.resolve():
+                results.append(ActionResult(
+                    source=src,
+                    target=target,
+                    action="move",
+                    success=True,
+                    error=None,
+                    dry_run=False,
+                ))
+                continue
+        except OSError:
+            pass
+
+        try:
+            # 跨设备自动 fallback: move() 在同设备是 rename, 跨设备复制+删除
+            shutil.move(str(src), str(target))
+            results.append(ActionResult(
+                source=src,
+                target=target,
+                action="move",
+                success=True,
+                dry_run=False,
+            ))
+            undo_entries.append({
+                "op": "move",
+                "from": str(target),
+                "to": str(src),
+            })
+        except OSError as e:
+            results.append(ActionResult(
+                source=src,
+                target=target,
+                action="move",
+                success=False,
+                error=str(e),
+                dry_run=False,
+            ))
+
+    undo_log_path = _write_undo_log(group, "move", undo_entries, dry_run)
+    return BatchActionResult(
+        group=group,
+        action="move",
+        dry_run=dry_run,
+        results=results,
+        undo_log_path=undo_log_path,
+    )
+
+
+# ----- delete -----
+
+
+def delete_duplicates(
+    group: DuplicateGroup,
+    *,
+    dry_run: bool = False,
+    use_trash: bool = True,
+) -> BatchActionResult:
+    """删 group.duplicates（不动 keeper）.
+
+    Args:
+        group: 重复组
+        dry_run: True 时只列将要做什么
+        use_trash: True 时移到回收站（send2trash 库, 跨平台）, False 时真删
+    Returns:
+        BatchActionResult
+    """
+    results: list[ActionResult] = []
+    undo_entries: list[dict] = []
+
+    for src in group.duplicates:
+        if dry_run:
+            results.append(ActionResult(
+                source=src,
+                target=None,
+                action="delete",
+                success=True,
+                dry_run=True,
+            ))
+            continue
+
+        try:
+            if use_trash:
+                _safe_send2trash(src)
+            else:
+                os.remove(src)
+            results.append(ActionResult(
+                source=src,
+                target=None,
+                action="delete",
+                success=True,
+                dry_run=False,
+            ))
+            undo_entries.append({
+                "op": "delete" if not use_trash else "trash",
+                "path": str(src),
+            })
+        except OSError as e:
+            results.append(ActionResult(
+                source=src,
+                target=None,
+                action="delete",
+                success=False,
+                error=str(e),
+                dry_run=False,
+            ))
+
+    undo_log_path = _write_undo_log(group, "delete", undo_entries, dry_run)
+    return BatchActionResult(
+        group=group,
+        action="delete",
+        dry_run=dry_run,
+        results=results,
+        undo_log_path=undo_log_path,
+    )
+
+
+# ----- hardlink -----
+
+
+def hardlink_duplicates(
+    group: DuplicateGroup,
+    *,
+    dry_run: bool = False,
+    overwrite: bool = False,
+) -> BatchActionResult:
+    """用硬链接替换 duplicates（指向 keeper, 节省空间且保留访问路径）.
+
+    原理：删原文件 → os.link(keeper, 原路径), 这样所有"重复"实际是同一 inode。
+    优点：删一个不影响其他路径访问, 改一处全改（不同副本会同步）。
+    注意：Windows 上 os.link 需要同卷 + 经常需要管理员/开发者模式；失败给明确报错。
+
+    Args:
+        group: 重复组
+        dry_run: True 时只列将要做什么
+        overwrite: True 时已存在的目标会被替换, False 时同名跳过
+    Returns:
+        BatchActionResult
+    """
+    keeper = group.keeper
+    platform_name = platform.system()  # "Windows" / "Linux" / "Darwin"
+    results: list[ActionResult] = []
+    undo_entries: list[dict] = []
+
+    for src in group.duplicates:
+        if dry_run:
+            results.append(ActionResult(
+                source=src,
+                target=src,  # 硬链后路径不变
+                action="hardlink",
+                success=True,
+                dry_run=True,
+            ))
+            continue
+
+        # src 就是 keeper 的 path → 跳过
+        try:
+            if src.resolve() == keeper.resolve():
+                results.append(ActionResult(
+                    source=src,
+                    target=src,
+                    action="hardlink",
+                    success=True,
+                    dry_run=False,
+                ))
+                continue
+        except OSError:
+            pass
+
+        # 删原文件 → 建硬链
+        # 注: 硬链的目的地就是 src 本身, 不需要 overwrite 检查
+        # 流程: os.remove(src) → os.link(keeper, src), src 路径最终指向 keeper 的 inode
+        try:
+            os.remove(src)
+            os.link(keeper, src)
+            results.append(ActionResult(
+                source=src,
+                target=src,
+                action="hardlink",
+                success=True,
+                dry_run=False,
+            ))
+            # undo: 删硬链 + 把 keeper 复制回 src 路径
+            # 但硬链和原文件是同一 inode, "撤销"实际是复制一份
+            # 为了简单, undo 标 hardlink 反向 = unlink + copy
+            undo_entries.append({
+                "op": "hardlink",
+                "path": str(src),
+                "keeper": str(keeper),
+            })
+        except OSError as e:
+            # 跨平台常见错: Windows 跨卷 / 权限不够 / 文件被占用
+            hint = ""
+            if platform_name == "Windows":
+                hint = (
+                    " (Windows 上硬链需: 同卷 + 管理员/开发者模式, "
+                    "或文件已被其他进程占用)"
+                )
+            results.append(ActionResult(
+                source=src,
+                target=src,
+                action="hardlink",
+                success=False,
+                error=f"{e}{hint}",
+                dry_run=False,
+            ))
+
+    # hardlink 不写 undo log（无数据丢失, 但能反链回独立副本需要复制, 不在这里写）
+    return BatchActionResult(
+        group=group,
+        action="hardlink",
+        dry_run=dry_run,
+        results=results,
+        undo_log_path=None,
+    )
+
+
 # ----- 内部 helper -----
 
 
@@ -245,4 +619,46 @@ def _stat_safe(path: Path):
     try:
         return path.stat()
     except (OSError, ValueError):
+        return None
+
+
+def _safe_send2trash(path: Path) -> None:
+    """调 send2trash 移回收站, 没装就 raise ImportError 引导装包."""
+    try:
+        from send2trash import send2trash  # type: ignore[import-not-found]
+    except ImportError as e:
+        raise ImportError(
+            "需要 send2trash 库才能移到回收站, 装: pip install send2trash"
+        ) from e
+    send2trash(str(path))
+
+
+def _write_undo_log(
+    group: DuplicateGroup,
+    action: str,
+    entries: list[dict],
+    dry_run: bool,
+) -> Path | None:
+    """写 undo 日志 (move/delete 成功条目).
+
+    文件位置: <user_home>/.filemaster/undo/<timestamp>_<hash>_<action>.json
+    不写: dry_run / 失败 / hardlink
+    """
+    if dry_run or action == "hardlink" or not entries:
+        return None
+    try:
+        home = Path.home() / ".filemaster" / "undo"
+        home.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = home / f"{ts}_{group.hash_value[:8]}_{action}.json"
+        payload = {
+            "action": action,
+            "timestamp": ts,
+            "group_hash": group.hash_value,
+            "keeper": str(group.keeper),
+            "entries": entries,
+        }
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        return path
+    except OSError:
         return None

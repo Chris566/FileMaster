@@ -1,13 +1,15 @@
-"""去重后台 Worker（W4 v3：只查 + 表格预览）.
+"""去重后台 Worker（W4 v4：异步执行 move/delete/hardlink）.
 
-模式与 BatchWorker / ClassifyWorker / PreviewWorker 一致：
-QObject + QThread + 协作式取消 + 进度信号。
+W4 v4 Worker 模式（跟 W4 v3 DedupWorker 一致）：
+QObject + QThread + 协作式取消 + 进度信号 + 3 个完成信号。
 
-W4 v3 范围（用户拍板）：
-- 只查，不动文件
+W4 v4 范围：
+- move_duplicates / delete_duplicates / hardlink_duplicates 异步包装
 - 进度信号: progressed(percent, message)
-- 完成信号: finished(groups, stats)
+- 完成信号: finished(BatchActionResult)
 - 失败信号: failed(error_msg)
+- dry-run 透传
+- 每文件粒度错误隔离（_run_action 内部不 raise, 失败写进 ActionResult）
 """
 
 from __future__ import annotations
@@ -18,10 +20,14 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal
 
 from filemaster.core.dedup import (
+    BatchActionResult,
     Deduper,
     DedupStats,
     DuplicateFile,
     DuplicateGroup,
+    delete_duplicates,
+    hardlink_duplicates,
+    move_duplicates,
 )
 from filemaster.utils.hash import file_hash
 
@@ -152,6 +158,171 @@ class DedupWorker(QObject):
 
         except Exception as e:
             self.failed.emit(f"去重过程异常: {e}")
+
+
+# ----- W4 v4：DedupActionWorker -----
+
+
+class DedupActionWorker(QObject):
+    """去重动作 Worker（W4 v4：move / delete / hardlink 异步执行）.
+
+    跟 DedupWorker 同样模式：QObject + QThread + 协作式取消。
+    接受一个 DuplicateGroup, 跑一个动作, 出 BatchActionResult.
+    """
+
+    progressed = Signal(int, str)          # (percent, message)
+    finished = Signal(object)              # (BatchActionResult)
+    failed = Signal(str)                   # error_msg
+
+    def __init__(
+        self,
+        group: DuplicateGroup,
+        action: str,
+        *,
+        target_dir: Path | None = None,
+        dry_run: bool = False,
+        overwrite: bool = False,
+        use_trash: bool = True,
+    ) -> None:
+        super().__init__()
+        self._group = group
+        self._action = action  # "move" | "delete" | "hardlink"
+        self._target_dir = target_dir
+        self._dry_run = dry_run
+        self._overwrite = overwrite
+        self._use_trash = use_trash
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
+
+    def run(self) -> None:
+        try:
+            self.progressed.emit(0, f"开始 {self._action} (dry_run={self._dry_run}) ...")
+            t0 = time.monotonic()
+            total = len(self._group.duplicates)
+            if total == 0:
+                self.failed.emit("该组没有重复文件（只有 keeper）")
+                return
+
+            # 每文件执行, 单文件错误隔离
+            results: list = []
+            undo_entries: list[dict] = []
+
+            for i, src in enumerate(self._group.duplicates, 1):
+                if self._cancel_requested:
+                    self.failed.emit(f"用户取消 (已处理 {i - 1}/{total})")
+                    return
+
+                # 单文件动作 - 包 try/except 防止 OSError 击穿
+                file_result = self._run_single(src)
+                results.append(file_result)
+                if file_result.success and not self._dry_run:
+                    undo_entries.append(self._undo_for(src))
+
+                pct = int(100 * i / total)
+                status = "✓" if file_result.success else "✗"
+                self.progressed.emit(
+                    pct,
+                    f"{status} {self._action} {i}/{total}: {src.name}",
+                )
+
+            # 写 undo log
+            undo_log_path = None
+            if not self._dry_run and self._action != "hardlink" and undo_entries:
+                undo_log_path = self._write_undo_log(undo_entries)
+
+            from filemaster.core.dedup import BatchActionResult
+            batch = BatchActionResult(
+                group=self._group,
+                action=self._action,
+                dry_run=self._dry_run,
+                results=results,
+                undo_log_path=undo_log_path,
+            )
+
+            duration_ms = int((time.monotonic() - t0) * 1000)
+            self.progressed.emit(
+                100,
+                f"{self._action} 完成: 成功 {batch.success_count}/{total}, "
+                f"失败 {batch.fail_count}, 耗时 {duration_ms} ms",
+            )
+            self.finished.emit(batch)
+        except Exception as e:
+            self.failed.emit(f"{self._action} 异常: {e}")
+
+    def _run_single(self, src: Path):
+        """对 group 跑对应动作, 过滤出 src 的单文件结果.
+
+        不用 DuplicateGroup 单文件重建, 直接跑整个 group, 找到 src 对应的
+        ActionResult 返出来 (避免 hardlink 边界: src.mtime < keeper.mtime 时
+        src 会被选为新 keeper, duplicates 为空, 函数返空 batch).
+        """
+        from filemaster.core.dedup import ActionResult
+
+        if self._action == "move":
+            if self._dry_run:
+                target = (self._target_dir or (self._group.keeper.parent / "_duplicates")) / src.name
+                return ActionResult(source=src, target=target, action="move", success=True, dry_run=True)
+            batch = move_duplicates(self._group, self._target_dir, dry_run=False, overwrite=self._overwrite)
+        elif self._action == "delete":
+            if self._dry_run:
+                return ActionResult(source=src, target=None, action="delete", success=True, dry_run=True)
+            batch = delete_duplicates(self._group, dry_run=False, use_trash=self._use_trash)
+        elif self._action == "hardlink":
+            if self._dry_run:
+                return ActionResult(source=src, target=src, action="hardlink", success=True, dry_run=True)
+            batch = hardlink_duplicates(self._group, dry_run=False, overwrite=self._overwrite)
+        else:
+            return ActionResult(
+                source=src, target=None, action=self._action,
+                success=False, error=f"未知 action: {self._action}", dry_run=False,
+            )
+
+        # 找 src 对应的那条结果
+        for r in batch.results:
+            try:
+                if r.source.resolve() == src.resolve():
+                    return r
+            except OSError:
+                if str(r.source) == str(src):
+                    return r
+        # 兜底：没找到 → 返 fail
+        return ActionResult(
+            source=src, target=None, action=self._action,
+            success=False, error="no result returned", dry_run=False,
+        )
+
+    def _undo_for(self, src: Path) -> dict:
+        """生成单文件 undo 条目."""
+        if self._action == "move":
+            target = (self._target_dir or (self._group.keeper.parent / "_duplicates")) / src.name
+            return {"op": "move", "from": str(target), "to": str(src)}
+        elif self._action == "delete":
+            return {"op": "trash" if self._use_trash else "delete", "path": str(src)}
+        elif self._action == "hardlink":
+            return {"op": "hardlink", "path": str(src), "keeper": str(self._group.keeper)}
+        return {"op": "unknown"}
+
+    def _write_undo_log(self, entries: list[dict]) -> Path | None:
+        """复用 core.dedup._write_undo_log 一样的逻辑."""
+        import json
+        try:
+            home = Path.home() / ".filemaster" / "undo"
+            home.mkdir(parents=True, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = home / f"{ts}_{self._group.hash_value[:8]}_{self._action}.json"
+            payload = {
+                "action": self._action,
+                "timestamp": ts,
+                "group_hash": self._group.hash_value,
+                "keeper": str(self._group.keeper),
+                "entries": entries,
+            }
+            path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            return path
+        except OSError:
+            return None
 
 
 # 暴露一个 facade 函数, 跟核心 Deduper 行为一致

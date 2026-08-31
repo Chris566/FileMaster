@@ -53,7 +53,14 @@ from filemaster.core.classifier import (
     classify_batch,
     classify_file,
 )
-from filemaster.core.dedup import Deduper, DedupStats, DuplicateGroup
+from filemaster.core.dedup import (
+    Deduper,
+    DedupStats,
+    DuplicateGroup,
+    delete_duplicates,
+    hardlink_duplicates,
+    move_duplicates,
+)
 from filemaster.core.preview import FileMetadata, PreviewContent, PreviewKind
 from filemaster.core.renamer import ConflictStrategy
 from filemaster.core.template import Template
@@ -61,7 +68,7 @@ from filemaster.core.undo import UndoStack
 from filemaster.io.config import Config, default_config_dir
 from filemaster.workers.batch import BatchWorker
 from filemaster.workers.classify import ClassifyWorker
-from filemaster.workers.dedup import DedupWorker
+from filemaster.workers.dedup import DedupActionWorker, DedupWorker
 from filemaster.workers.preview import PreviewWorker
 
 # Category 颜色映射（GUI 表格列染色）
@@ -126,6 +133,10 @@ class MainWindow(QMainWindow):
         self._dedup_worker: DedupWorker | None = None
         self._dedup_groups: list[DuplicateGroup] = []  # 缓存去重结果
         self._dedup_stats: DedupStats | None = None  # 缓存统计
+
+        # W4 v4：Dedup 动作线程/Worker（move/delete/hardlink 异步执行）
+        self._dedup_action_thread: QThread | None = None
+        self._dedup_action_worker: DedupActionWorker | None = None
 
         # 构造 UI
         self._build_menu()
@@ -447,6 +458,60 @@ class MainWindow(QMainWindow):
         self._table_dedup.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table_dedup.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         v_dd.addWidget(self._table_dedup)
+
+        # ---- W4 v4: 动作按钮 + dry-run + 目标目录 ----
+        gb_dedup_actions = QGroupBox("W4 v4 动作（作用于选中的行）")
+        v_act = QVBoxLayout(gb_dedup_actions)
+
+        # 目标目录行（move 用）
+        h_tgt = QHBoxLayout()
+        h_tgt.addWidget(QLabel("目标目录:"))
+        self._txt_dedup_target = QLineEdit()
+        self._txt_dedup_target.setPlaceholderText("<source>/_duplicates/ (move 时默认)")
+        btn_tgt = QPushButton("📁")
+        btn_tgt.setFixedWidth(32)
+        btn_tgt.setToolTip("选择 move 动作的目标目录")
+        btn_tgt.clicked.connect(self._on_choose_dedup_target)
+        h_tgt.addWidget(self._txt_dedup_target, stretch=1)
+        h_tgt.addWidget(btn_tgt)
+        v_act.addLayout(h_tgt)
+
+        # 选项行
+        h_opt = QHBoxLayout()
+        self._chk_dedup_dryrun = QCheckBox("Dry-run (推荐先开)")
+        self._chk_dedup_dryrun.setChecked(True)
+        h_opt.addWidget(self._chk_dedup_dryrun)
+        self._chk_dedup_overwrite = QCheckBox("覆盖已存在")
+        self._chk_dedup_overwrite.setChecked(False)
+        h_opt.addWidget(self._chk_dedup_overwrite)
+        self._chk_dedup_trash = QCheckBox("删时进回收站")
+        self._chk_dedup_trash.setChecked(True)
+        h_opt.addWidget(self._chk_dedup_trash)
+        h_opt.addStretch(1)
+        v_act.addLayout(h_opt)
+
+        # 3 个动作按钮
+        h_btn = QHBoxLayout()
+        self._btn_dedup_move = QPushButton("📁 移动到目标")
+        self._btn_dedup_move.setToolTip("把选中组的 duplicates 移到目标目录（keep 最老）")
+        self._btn_dedup_move.clicked.connect(lambda: self._on_dedup_action("move"))
+        h_btn.addWidget(self._btn_dedup_move)
+
+        self._btn_dedup_delete = QPushButton("🗑️ 删除")
+        self._btn_dedup_delete.setProperty("role", "danger")
+        self._btn_dedup_delete.setToolTip("删选中组的 duplicates（默认进回收站）")
+        self._btn_dedup_delete.clicked.connect(lambda: self._on_dedup_action("delete"))
+        h_btn.addWidget(self._btn_dedup_delete)
+
+        self._btn_dedup_hardlink = QPushButton("🔗 硬链接")
+        self._btn_dedup_hardlink.setToolTip("用硬链替换 duplicates 指向 keeper（Unix 推荐, Windows 可能失败）")
+        self._btn_dedup_hardlink.clicked.connect(lambda: self._on_dedup_action("hardlink"))
+        h_btn.addWidget(self._btn_dedup_hardlink)
+
+        h_btn.addStretch(1)
+        v_act.addLayout(h_btn)
+
+        v_dd.addWidget(gb_dedup_actions)
 
         self._center_stack.addWidget(gb_dedup)  # index 1
 
@@ -1170,6 +1235,233 @@ class MainWindow(QMainWindow):
         # 启动 PreviewWorker
         self._run_preview_worker(target)
 
+    # ---------- W4 v4: Dedup 动作 (move/delete/hardlink) ----------
+
+    def _on_choose_dedup_target(self) -> None:
+        """选择 move 目标目录."""
+        path = QFileDialog.getExistingDirectory(
+            self, "选择 move 目标目录", self._txt_dedup_target.text() or ""
+        )
+        if path:
+            self._txt_dedup_target.setText(path)
+
+    def _get_selected_dedup_group(self) -> DuplicateGroup | None:
+        """拿当前表格里选中的那个 DuplicateGroup."""
+        items = self._table_dedup.selectedItems()
+        if not items:
+            QMessageBox.information(self, "未选择", "请先在表格里选中一行重复组")
+            return None
+        row = items[0].row()
+        if row < 0 or row >= len(self._dedup_groups):
+            return None
+        return self._dedup_groups[row]
+
+    def _on_dedup_action(self, action: str) -> None:
+        """3 个动作的统一入口: 校验 + 二次确认 + 启 worker."""
+        group = self._get_selected_dedup_group()
+        if group is None:
+            return
+
+        # 已经在跑 → 不允许
+        if self._dedup_action_thread is not None and self._dedup_action_thread.isRunning():
+            QMessageBox.information(self, "运行中", "已有动作进行中, 请先等待完成")
+            return
+
+        dry_run = self._chk_dedup_dryrun.isChecked()
+        overwrite = self._chk_dedup_overwrite.isChecked()
+        use_trash = self._chk_dedup_trash.isChecked()
+
+        # 目标目录(只 move 用)
+        target_dir: Path | None = None
+        if action == "move":
+            txt = self._txt_dedup_target.text().strip()
+            if txt:
+                target_dir = Path(txt).resolve()
+
+        # 二次确认(非 dry-run 时)
+        if not dry_run:
+            label_map = {"move": "移动", "delete": "删除", "hardlink": "硬链接"}
+            action_label = label_map[action]
+            keeper = group.keeper
+            dups = group.duplicates
+            preview = "\n".join(f"  • {d}" for d in dups[:5])
+            if len(dups) > 5:
+                preview += f"\n  ... 还有 {len(dups) - 5} 个"
+            confirm_msg = (
+                f"确认要{action_label}这 {len(dups)} 个重复文件吗？\n\n"
+                f"保留（keeper）: {keeper}\n\n"
+                f"{action_label}：\n{preview}\n\n"
+            )
+            if action == "move" and target_dir:
+                confirm_msg += f"目标目录: {target_dir}\n"
+            if action == "delete":
+                if use_trash:
+                    confirm_msg += "⚠️ 将移到回收站 (send2trash)\n"
+                else:
+                    confirm_msg += "🚨 直接永久删除（不进回收站）\n"
+            if action == "hardlink":
+                confirm_msg += "⚠️ 硬链: 删原文件, 用 os.link 建链到 keeper（无 undo）\n"
+            confirm_msg += "\n确定继续？"
+            reply = QMessageBox.question(
+                self,
+                f"确认{action_label}",
+                confirm_msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                self._log(f"用户取消 {action}")
+                return
+
+        self._run_dedup_action_worker(
+            group, action,
+            target_dir=target_dir,
+            dry_run=dry_run,
+            overwrite=overwrite,
+            use_trash=use_trash,
+        )
+
+    def _run_dedup_action_worker(
+        self,
+        group: DuplicateGroup,
+        action: str,
+        *,
+        target_dir: Path | None,
+        dry_run: bool,
+        overwrite: bool,
+        use_trash: bool,
+    ) -> None:
+        """异步启动 DedupActionWorker."""
+        # 取消旧 worker
+        if self._dedup_action_thread is not None and self._dedup_action_thread.isRunning():
+            if self._dedup_action_worker is not None:
+                self._dedup_action_worker.cancel()
+            self._dedup_action_thread.quit()
+            self._dedup_action_thread.wait(1000)
+            self._dedup_action_thread = None
+            self._dedup_action_worker = None
+
+        mode = "DRY-RUN" if dry_run else "EXEC"
+        self._log(
+            f"{action} 启动 [{mode}]: group={group.hash_value[:12]}... "
+            f"keeper={group.keeper} duplicates={len(group.duplicates)}"
+        )
+        self._lbl_dedup_summary.setText(
+            f"⚙️ 正在 {action} ... ({mode}, {len(group.duplicates)} 个文件)"
+        )
+
+        # 启动新 worker
+        self._dedup_action_thread = QThread(self)
+        self._dedup_action_worker = DedupActionWorker(
+            group=group,
+            action=action,
+            target_dir=target_dir,
+            dry_run=dry_run,
+            overwrite=overwrite,
+            use_trash=use_trash,
+        )
+        self._dedup_action_worker.moveToThread(self._dedup_action_thread)
+        self._dedup_action_thread.started.connect(self._dedup_action_worker.run)
+        self._dedup_action_worker.progressed.connect(self._on_dedup_action_progressed)
+        self._dedup_action_worker.finished.connect(self._on_dedup_action_finished)
+        self._dedup_action_worker.failed.connect(self._on_dedup_action_failed)
+        self._dedup_action_thread.start()
+
+        # UI 状态
+        self._btn_dedup.setEnabled(False)
+        self._btn_dedup_move.setEnabled(False)
+        self._btn_dedup_delete.setEnabled(False)
+        self._btn_dedup_hardlink.setEnabled(False)
+        self._progress.setValue(0)
+        self._progress.setVisible(True)
+
+    def _on_dedup_action_progressed(self, percent: int, message: str) -> None:
+        self._progress.setValue(percent)
+        self.statusBar().showMessage(f"动作: {message}")
+
+    def _on_dedup_action_finished(self, batch) -> None:
+        """DedupActionWorker 完成 → 汇总 + 刷表格 + 提示."""
+        from filemaster.core.dedup import BatchActionResult
+
+        if not isinstance(batch, BatchActionResult):
+            self._log(f"⚠️ 异常: 收到非 BatchActionResult: {type(batch)}")
+            return
+
+        # 汇总日志
+        self._log(
+            f"{batch.action} 完成 [{'DRY-RUN' if batch.dry_run else 'EXEC'}]: "
+            f"成功 {batch.success_count}/{len(batch.results)} "
+            f"失败 {batch.fail_count}"
+        )
+        for r in batch.results:
+            if r.success:
+                if r.dry_run:
+                    self._log(f"  [DRY] {r.action} {r.source} → {r.target or '(delete)'}")
+                else:
+                    if r.target:
+                        self._log(f"  ✓ {r.action}: {r.source} → {r.target}")
+                    else:
+                        self._log(f"  ✓ {r.action}: {r.source}")
+            else:
+                self._log(f"  ✗ {r.source}: {r.error}")
+        if batch.undo_log_path:
+            self._log(f"  ↩ undo log: {batch.undo_log_path}")
+
+        # 摘要
+        mode = "DRY-RUN" if batch.dry_run else "EXEC"
+        self._lbl_dedup_summary.setText(
+            f"✅ {batch.action} 完成 ({mode}): 成功 {batch.success_count} / "
+            f"失败 {batch.fail_count} / "
+            f"{'dry-run' if batch.dry_run else '实际'}"
+        )
+
+        # 进度条收尾
+        self._progress.setVisible(False)
+        self._btn_dedup.setEnabled(True)
+        self._btn_dedup_move.setEnabled(True)
+        self._btn_dedup_delete.setEnabled(True)
+        self._btn_dedup_hardlink.setEnabled(True)
+        if self._dedup_action_thread is not None:
+            self._dedup_action_thread.quit()
+            self._dedup_action_thread.wait(2000)
+        self._dedup_action_thread = None
+        self._dedup_action_worker = None
+
+        # 真动作后建议重新扫描
+        if not batch.dry_run and batch.success_count > 0:
+            ret = QMessageBox.question(
+                self,
+                f"{batch.action} 完成",
+                f"成功 {batch.success_count} 个 / 失败 {batch.fail_count} 个\n\n"
+                f"建议重新扫描以更新表格。\n\n现在重新扫描？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if ret == QMessageBox.StandardButton.Yes:
+                self._on_dedup()  # 重新启动 DedupWorker
+        else:
+            QMessageBox.information(
+                self,
+                f"{batch.action} 完成",
+                f"成功 {batch.success_count} / 失败 {batch.fail_count}\n"
+                f"{'（DRY-RUN, 未实际改动）' if batch.dry_run else ''}",
+            )
+
+    def _on_dedup_action_failed(self, error: str) -> None:
+        self._log(f"动作失败: {error}")
+        self._lbl_dedup_summary.setText(f"❌ 动作失败: {error}")
+        self._progress.setVisible(False)
+        self._btn_dedup.setEnabled(True)
+        self._btn_dedup_move.setEnabled(True)
+        self._btn_dedup_delete.setEnabled(True)
+        self._btn_dedup_hardlink.setEnabled(True)
+        if self._dedup_action_thread is not None and self._dedup_action_thread.isRunning():
+            self._dedup_action_thread.quit()
+            self._dedup_action_thread.wait(2000)
+        self._dedup_action_thread = None
+        self._dedup_action_worker = None
+        QMessageBox.warning(self, "动作失败", error)
+
     # ---------- W2：重命名 ----------
 
     def _on_start(self) -> None:
@@ -1293,6 +1585,11 @@ class MainWindow(QMainWindow):
                 self._dedup_worker.cancel()
             self._dedup_thread.quit()
             self._dedup_thread.wait(2000)
+        if self._dedup_action_thread is not None and self._dedup_action_thread.isRunning():
+            if self._dedup_action_worker is not None:
+                self._dedup_action_worker.cancel()
+            self._dedup_action_thread.quit()
+            self._dedup_action_thread.wait(2000)
         super().closeEvent(event)
 
     # ---------- 撤销 / 关于 ----------

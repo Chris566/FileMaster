@@ -5,6 +5,12 @@ W2-W4 会在此填实现细节。
 """
 
 from filemaster.core.classifier import Classifier
+from filemaster.core.dedup import (
+    Deduper,
+    DedupStats,
+    DuplicateFile,
+    DuplicateGroup,
+)
 from filemaster.core.preview import (
     FileMetadata,
     PreviewContent,
@@ -25,6 +31,10 @@ __all__ = [
     "PreviewContent",
     "FileMetadata",
     "build_preview",
+    "Deduper",
+    "DuplicateGroup",
+    "DuplicateFile",
+    "DedupStats",
     "UndoStack",
     "UndoEntry",
 ]

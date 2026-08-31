@@ -233,6 +233,151 @@ def _cmd_rename(args: argparse.Namespace) -> int:
 
 
 # ============================================================
+# W4 v4: dedup-scan + dedup-move/delete/hardlink
+# ============================================================
+
+
+def _cmd_dedup_scan(args: argparse.Namespace) -> int:
+    """扫描 + 找重复 (只查, 不动文件)."""
+    from filemaster.core.dedup import Deduper
+
+    source = Path(args.source).resolve()
+    if not source.is_dir():
+        print(f"❌ 源目录不存在: {source}", file=sys.stderr)
+        return 1
+
+    print(f"🔍 扫描 {source} (算法={args.algorithm}, 递归={args.recursive}) ...")
+    deduper = Deduper(algorithm=args.algorithm)
+    if args.recursive:
+        files = sorted(p for p in source.rglob("*") if p.is_file())
+    else:
+        files = sorted(p for p in source.iterdir() if p.is_file())
+    groups, stats = deduper.find_duplicates_with_meta(files)
+
+    print(
+        f"📊 扫描 {stats.total_files} 个文件 / "
+        f"发现 {stats.duplicate_groups} 组重复 / "
+        f"{stats.duplicate_files} 个可清理 / "
+        f"浪费 {stats.wasted_human} / 耗时 {stats.duration_ms} ms"
+    )
+
+    if args.json:
+        # JSON 模式: 输出可脚本消费的格式
+        out = {
+            "stats": stats.to_dict(),
+            "groups": [
+                {
+                    "hash": g.hash_value,
+                    "algorithm": g.algorithm,
+                    "size": g.hash_size,
+                    "count": g.count,
+                    "wasted_bytes": g.wasted_bytes,
+                    "keeper": str(g.keeper),
+                    "duplicates": [str(f) for f in g.duplicates],
+                }
+                for g in groups
+            ],
+        }
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    else:
+        # 人类可读模式
+        for i, g in enumerate(groups, 1):
+            keeper = g.keeper
+            print(
+                f"\n  [{i}] hash={g.hash_value[:12]}... "
+                f"size={g.hash_size}B count={g.count} "
+                f"wasted={g.wasted_bytes}B"
+            )
+            print(f"      keeper:    {keeper}")
+            for dup in g.duplicates:
+                print(f"      duplicate: {dup}")
+
+    return 0
+
+
+def _cmd_dedup_action(action: str) -> callable:
+    """构造 dedup-move / dedup-delete / dedup-hardlink 共用 handler."""
+    from filemaster.core.dedup import (
+        Deduper,
+        delete_duplicates,
+        hardlink_duplicates,
+        move_duplicates,
+    )
+
+    func_map = {
+        "move": move_duplicates,
+        "delete": delete_duplicates,
+        "hardlink": hardlink_duplicates,
+    }
+
+    def handler(args: argparse.Namespace) -> int:
+        source = Path(args.source).resolve()
+        if not source.is_dir():
+            print(f"❌ 源目录不存在: {source}", file=sys.stderr)
+            return 1
+
+        # 1) 扫描
+        print(f"🔍 扫描 {source} (算法={args.algorithm}, 递归={args.recursive}) ...")
+        deduper = Deduper(algorithm=args.algorithm)
+        if args.recursive:
+            files = sorted(p for p in source.rglob("*") if p.is_file())
+        else:
+            files = sorted(p for p in source.iterdir() if p.is_file())
+        groups, stats = deduper.find_duplicates_with_meta(files)
+        if stats.duplicate_groups == 0:
+            print("📊 未发现重复文件, 退出")
+            return 0
+        print(
+            f"📊 {stats.duplicate_groups} 组 / "
+            f"{stats.duplicate_files} 个可处理 / "
+            f"浪费 {stats.wasted_human}"
+        )
+
+        # 2) 目标目录(只 move 用)
+        target_dir = None
+        if action == "move" and args.target:
+            target_dir = Path(args.target).resolve()
+            print(f"📂 目标目录: {target_dir}")
+
+        # 3) 跑动作
+        func = func_map[action]
+        total_ok = 0
+        total_fail = 0
+        for i, g in enumerate(groups, 1):
+            kw = {"dry_run": args.dry_run}
+            if action == "move":
+                kw["target_dir"] = target_dir
+                kw["overwrite"] = args.overwrite
+            elif action == "delete":
+                kw["use_trash"] = args.use_trash
+            elif action == "hardlink":
+                kw["overwrite"] = args.overwrite
+
+            batch = func(g, **kw)
+            mode = "DRY-RUN" if args.dry_run else "EXEC"
+            print(
+                f"\n  [{i}/{len(groups)}] {mode} {action}: "
+                f"成功 {batch.success_count}/{len(g.duplicates)} "
+                f"失败 {batch.fail_count}"
+            )
+            for r in batch.results:
+                if not r.success:
+                    print(f"    ✗ {r.source}: {r.error}")
+            total_ok += batch.success_count
+            total_fail += batch.fail_count
+            if batch.undo_log_path:
+                print(f"    ↩ undo log: {batch.undo_log_path}")
+
+        print(
+            f"\n✅ 完成: 成功 {total_ok} / 失败 {total_fail} / "
+            f"{'dry-run' if args.dry_run else '实际'}"
+        )
+        return 0 if total_fail == 0 else 1
+
+    return handler
+
+
+# ============================================================
 # 顶层 parser
 # ============================================================
 
@@ -241,9 +386,9 @@ def build_parser() -> argparse.ArgumentParser:
     """构造 CLI 参数解析器."""
     parser = argparse.ArgumentParser(
         prog="filemaster",
-        description="FileMaster — 文件批量处理工具（W4 v1：Classifier）",
+        description="FileMaster — 文件批量处理工具（W4 v4：Dedup 动作）",
     )
-    parser.add_argument("--version", action="version", version="0.3.0")
+    parser.add_argument("--version", action="version", version="0.4.0")
 
     sub = parser.add_subparsers(dest="command", help="子命令")
 
@@ -288,6 +433,86 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_rename.add_argument("--dry-run", action="store_true", help="试运行")
     p_rename.set_defaults(func=_cmd_rename)
+
+    # ----- dedup-scan (W4 v4) -----
+    p_dedup_scan = sub.add_parser(
+        "dedup-scan", help="扫描找重复（W4 v4：只查, 不动文件）"
+    )
+    p_dedup_scan.add_argument("-s", "--source", required=True, help="源目录")
+    p_dedup_scan.add_argument(
+        "-r", "--recursive", action="store_true", default=True, help="递归（默认开）"
+    )
+    p_dedup_scan.add_argument(
+        "--algorithm", default="md5",
+        choices=["md5", "sha1", "sha256", "blake2b"],
+        help="hash 算法（默认 md5）",
+    )
+    p_dedup_scan.add_argument(
+        "--json", action="store_true", help="输出 JSON 格式（便于脚本管道）"
+    )
+    p_dedup_scan.set_defaults(func=_cmd_dedup_scan)
+
+    # ----- dedup-move (W4 v4) -----
+    p_dedup_move = sub.add_parser(
+        "dedup-move", help="把重复文件移到目标目录（W4 v4）"
+    )
+    p_dedup_move.add_argument("-s", "--source", required=True, help="源目录")
+    p_dedup_move.add_argument(
+        "-t", "--target", help="目标目录（默认 <source>/_duplicates/）"
+    )
+    p_dedup_move.add_argument(
+        "-r", "--recursive", action="store_true", default=True, help="递归（默认开）"
+    )
+    p_dedup_move.add_argument(
+        "--algorithm", default="md5", choices=["md5", "sha1", "sha256", "blake2b"]
+    )
+    p_dedup_move.add_argument(
+        "--overwrite", action="store_true", help="覆盖已存在的目标"
+    )
+    p_dedup_move.add_argument(
+        "--dry-run", action="store_true", help="只列将要做什么, 不真动"
+    )
+    p_dedup_move.set_defaults(func=_cmd_dedup_action("move"))
+
+    # ----- dedup-delete (W4 v4) -----
+    p_dedup_delete = sub.add_parser(
+        "dedup-delete", help="删重复文件（W4 v4）"
+    )
+    p_dedup_delete.add_argument("-s", "--source", required=True, help="源目录")
+    p_dedup_delete.add_argument(
+        "-r", "--recursive", action="store_true", default=True, help="递归（默认开）"
+    )
+    p_dedup_delete.add_argument(
+        "--algorithm", default="md5", choices=["md5", "sha1", "sha256", "blake2b"]
+    )
+    p_dedup_delete.add_argument(
+        "--use-trash", action="store_true", default=True,
+        help="移到回收站 (默认开, 需要 send2trash 库)",
+    )
+    p_dedup_delete.add_argument(
+        "--no-trash", dest="use_trash", action="store_false",
+        help="直接删, 不进回收站 (危险)",
+    )
+    p_dedup_delete.add_argument(
+        "--dry-run", action="store_true", help="只列将要做什么, 不真删"
+    )
+    p_dedup_delete.set_defaults(func=_cmd_dedup_action("delete"))
+
+    # ----- dedup-hardlink (W4 v4) -----
+    p_dedup_hl = sub.add_parser(
+        "dedup-hardlink", help="用硬链替换重复文件指向 keeper (W4 v4)"
+    )
+    p_dedup_hl.add_argument("-s", "--source", required=True, help="源目录")
+    p_dedup_hl.add_argument(
+        "-r", "--recursive", action="store_true", default=True, help="递归（默认开）"
+    )
+    p_dedup_hl.add_argument(
+        "--algorithm", default="md5", choices=["md5", "sha1", "sha256", "blake2b"]
+    )
+    p_dedup_hl.add_argument(
+        "--dry-run", action="store_true", help="只列将要做什么, 不真改"
+    )
+    p_dedup_hl.set_defaults(func=_cmd_dedup_action("hardlink"))
 
     return parser
 

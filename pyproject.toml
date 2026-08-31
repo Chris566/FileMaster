@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "filemaster"
-version = "0.1.0"
+version = "0.4.0"
 description = "FileMaster — 文件批量处理工具（重命名 / 分类 / 转换 / 去重 / 归档）"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -33,6 +33,7 @@ dependencies = [
     "PyMuPDF>=1.23",
     "Pillow>=10.0",
     "python-docx>=1.0",
+    "send2trash>=1.8",  # W4 v4: dedup delete 走回收站
 ]
 
 [project.optional-dependencies]
