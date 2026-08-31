@@ -1575,6 +1575,8 @@ class MainWindow(QMainWindow):
 
     def _on_progress(self, percent: int, file: str, index: int, total: int, message: str) -> None:
         self._progress.setValue(percent)
+        # W6: 进度条文本升级, 复用 W5 worker 传来的 "i/t (pct) ETA Ns" 格式
+        self._progress.setFormat(f"{file} · {message}" if message else f"{file} {percent}%")
         self.statusBar().showMessage(f"{message} · {file}")
 
     def _on_file_done(self, result) -> None:
@@ -1582,11 +1584,23 @@ class MainWindow(QMainWindow):
             name = result.target.name if result.target else result.source.name
         except Exception:
             name = str(result.source)
-        line = f"[{result.status:>10}] {result.source.name} → {name}"
+        # W6: 状态图标 - ✅ / ⚠️ / ⏭ / ❌ 让结果一眼可读 (W5 的 status 多了 RENAMED/OVERWRITTEN/DRY_RUN)
+        ok_statuses = ("OK", "RENAMED", "OVERWRITTEN", "DRY_RUN")
+        if result.status in ok_statuses:
+            icon = "✅"
+        elif result.status == "CONFLICT":
+            icon = "⚠️"
+        elif result.status == "SKIPPED":
+            icon = "⏭"
+        else:
+            icon = "❌"
+        line = f"{icon} [{result.status:>10}] {result.source.name} → {name}"
         if result.message:
             line += f"  ({result.message})"
+        # 写到隐藏的 _list_files (兼容 W2 调用) + 右侧可见日志面板
         self._list_files.addItem(line)
         self._list_files.scrollToBottom()
+        self._log(line)
 
     def _on_failed(self, file: str, error: str) -> None:
         self._log(f"失败: {file} - {error}")
