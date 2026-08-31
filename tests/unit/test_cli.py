@@ -40,12 +40,23 @@ PROJECT_ROOT = _project_root()
 def _run(*args: str, cwd: Path | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
     """跑 filemaster CLI 同步.
 
-    encoding="utf-8"：显式按 UTF-8 解码子进程 stdout/stderr——
-    Windows GitHub Actions runner 默认 locale 是 cp1252，emoji/中文输出不显式指定会解码错。
-    errors="replace"：真解码不了的字符用 ? 替换，不抛 UnicodeDecodeError。
+    encoding="utf-8": 显式按 UTF-8 解码子进程 stdout/stderr——
+    Windows GitHub Actions runner 默认 locale 是 cp1252, emoji/中文输出不显式指定会解码错。
+    errors="replace": 真解码不了的字符用 ? 替换, 不抛 UnicodeDecodeError。
     env: 显式传 env 时走指定 env (测试要改 HOME 隔离 undo log 时用);
         默认 None 走当前进程 os.environ 拷贝, 兼容其它测试.
+
+    Windows 兼容: env 里有 HOME 时自动同步设 USERPROFILE/HOMEDRIVE/HOMEPATH
+    (Python on Windows 的 ntpath.expanduser 只看 USERPROFILE, 不看 HOME).
     """
+    if env is not None and "HOME" in env and sys.platform == "win32":
+        env = dict(env)  # 不修改原 dict
+        home = env["HOME"]
+        env.setdefault("USERPROFILE", home)
+        # HOMEDRIVE 是 C: 之类, HOMEPATH 是 \Users\foo
+        # 简单起见, 设 HOMEDRIVE 为空, HOMEPATH 为 home 绝对路径
+        env.setdefault("HOMEDRIVE", "")
+        env.setdefault("HOMEPATH", home.replace("C:", "", 1) if home.upper().startswith("C:") else home)
     return subprocess.run(
         [sys.executable, "-m", "filemaster.cli", *args],
         capture_output=True,
