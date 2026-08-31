@@ -247,7 +247,12 @@ class TestDeleteDuplicates:
 
     def test_real_delete_use_trash_missing_package(self, dup_tree: Path, monkeypatch) -> None:
         """没装 send2trash 时 use_trash=True 应该 raise ImportError."""
-        # 直接调 core.dedup._safe_send2trash 来测这个边界
+        # 模拟 send2trash 未装: 把 sys.modules['send2trash'] 设为 None 让 import 失败
+        import sys
+        monkeypatch.setitem(sys.modules, "send2trash", None)
+        # 同时也清掉已经 import 过的缓存
+        from filemaster.core import dedup as _dedup_mod
+        monkeypatch.setattr(_dedup_mod, "send2trash", None, raising=False)
         from filemaster.core.dedup import _safe_send2trash
         with pytest.raises(ImportError, match="send2trash"):
             _safe_send2trash(dup_tree / "a_copy.txt")
