@@ -23,6 +23,28 @@ from filemaster.core.classifier import (
     group_by_category,
 )
 
+
+# ============================================================
+# W4 v1 fix: Windows CI runner 默认 cp1252，emoji/中文 print 必炸
+# 8/30 立过 smoke 脚本的同款问题（MEMORY.md），这次漏了 CLI 子进程入口。
+# 在模块加载时 reconfigure 到 UTF-8，errors="replace" 兜底任何真编码不了的字符。
+# ============================================================
+def _ensure_utf8_io() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue  # Python < 3.7 不支持
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_ensure_utf8_io()
+
 # ============================================================
 # classify 子命令
 # ============================================================
