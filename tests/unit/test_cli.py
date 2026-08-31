@@ -35,11 +35,18 @@ PROJECT_ROOT = _project_root()
 
 
 def _run(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    """跑 filemaster CLI 同步."""
+    """跑 filemaster CLI 同步.
+
+    encoding="utf-8"：显式按 UTF-8 解码子进程 stdout/stderr——
+    Windows GitHub Actions runner 默认 locale 是 cp1252，emoji/中文输出不显式指定会解码错。
+    errors="replace"：真解码不了的字符用 ? 替换，不抛 UnicodeDecodeError。
+    """
     return subprocess.run(
         [sys.executable, "-m", "filemaster.cli", *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=cwd or PROJECT_ROOT,
         timeout=30,
     )

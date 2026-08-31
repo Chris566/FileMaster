@@ -26,19 +26,51 @@ from filemaster.core.classifier import (
 
 # ============================================================
 # W4 v1 fix: Windows CI runner 默认 cp1252，emoji/中文 print 必炸
-# 8/30 立过 smoke 脚本的同款问题（MEMORY.md），这次漏了 CLI 子进程入口。
-# 在模块加载时 reconfigure 到 UTF-8，errors="replace" 兜底任何真编码不了的字符。
+# 8/30 在 smoke 脚本立过同款问题（MEMORY.md），这次漏了 CLI 子进程入口。
+# 双保险：
+#   1. reconfigure(encoding="utf-8", errors="replace")
+#   2. reconfigure 后 encoding 仍非 utf-8（Windows console 偶发不生效），
+#      强制用 TextIOWrapper 替换 sys.stdout/sys.stderr
+# 同步覆盖 sys.__stdout__ / sys.__stderr__（argparse 内部用 __stdout__）。
+# Linux/macOS 默认就 utf-8，全是 no-op，不影响行为。
 # ============================================================
 def _ensure_utf8_io() -> None:
+    import io
+
     for stream_name in ("stdout", "stderr"):
+        private_name = f"__{stream_name}__"
         stream = getattr(sys, stream_name, None)
         if stream is None:
             continue
+
+        ok = False
+        # 1) 尝试 reconfigure
         reconfigure = getattr(stream, "reconfigure", None)
-        if reconfigure is None:
-            continue  # Python < 3.7 不支持
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+                if getattr(stream, "encoding", None) == "utf-8":
+                    ok = True
+            except Exception:
+                pass
+
+        if ok:
+            continue
+
+        # 2) reconfigure 失败 → 强制 TextIOWrapper 替换
+        buf = getattr(stream, "buffer", None) or getattr(stream, "raw", None)
+        if buf is None:
+            continue
         try:
-            reconfigure(encoding="utf-8", errors="replace")
+            new_stream = io.TextIOWrapper(
+                buf,
+                encoding="utf-8",
+                errors="replace",
+                line_buffering=True,
+                write_through=False,
+            )
+            setattr(sys, stream_name, new_stream)
+            setattr(sys, private_name, new_stream)
         except Exception:
             pass
 
