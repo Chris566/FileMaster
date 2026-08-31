@@ -52,11 +52,15 @@ def _run(*args: str, cwd: Path | None = None, env: dict | None = None) -> subpro
     if env is not None and "HOME" in env and sys.platform == "win32":
         env = dict(env)  # 不修改原 dict
         home = env["HOME"]
-        env.setdefault("USERPROFILE", home)
+        # 必须用直接赋值, 不能用 setdefault —
+        # os.environ 在 Windows CI runner 上已有 USERPROFILE=C:\Users\xxx,
+        # setdefault 不会覆盖, subprocess 的 Path.home() 仍走真 user home,
+        # dedup-undo 找不到 test 造的 tmp_path log → 报 "没有 undo log".
+        env["USERPROFILE"] = home
         # HOMEDRIVE 是 C: 之类, HOMEPATH 是 \Users\foo
-        # 简单起见, 设 HOMEDRIVE 为空, HOMEPATH 为 home 绝对路径
-        env.setdefault("HOMEDRIVE", "")
-        env.setdefault("HOMEPATH", home.replace("C:", "", 1) if home.upper().startswith("C:") else home)
+        # 简单起见, HOMEDRIVE 清空, HOMEPATH 用 tmp_path 绝对路径
+        env["HOMEDRIVE"] = ""
+        env["HOMEPATH"] = home.replace("C:", "", 1) if home.upper().startswith("C:") else home
     return subprocess.run(
         [sys.executable, "-m", "filemaster.cli", *args],
         capture_output=True,
