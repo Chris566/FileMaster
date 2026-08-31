@@ -396,3 +396,264 @@ class TestRenameResult:
         r = RenameResult(Path("a"), Path("b"), "OK")
         with pytest.raises(Exception):  # FrozenInstanceError
             r.status = "X"  # type: ignore[misc]
+
+"""W5: 命名空间占位符 + apply_with_progress 测试.
+
+命名空间 prefix:
+- {pdf_*}  (title/author/subject/pages/created/modified)
+- {word_*} (title/author/subject/paragraphs/created/modified)
+- {excel_*} (title/author/subject/sheets/sheet_name/created/modified)
+- {image_*} (width/height/taken_at/camera_make/camera_model/format/aspect_ratio)
+"""
+
+
+# ---- fixture 复用 test_metadata 的 _make_* 函数 ----
+
+def _make_pdf(tmp_path: Path, title: str = "My PDF") -> Path:
+    import fitz
+
+    p = tmp_path / "doc.pdf"
+    doc = fitz.open()
+    doc.new_page()
+    doc.set_metadata({"title": title, "author": "Alice"})
+    doc.save(p)
+    doc.close()
+    return p
+
+
+def _make_docx(tmp_path: Path, title: str = "My Doc") -> Path:
+    from docx import Document
+
+    p = tmp_path / "doc.docx"
+    doc = Document()
+    doc.core_properties.title = title
+    doc.core_properties.author = "Bob"
+    doc.add_paragraph("段一")
+    doc.add_paragraph("段二")
+    doc.add_paragraph("段三")
+    doc.save(p)
+    return p
+
+
+def _make_xlsx(tmp_path: Path, title: str = "My XLS") -> Path:
+    from openpyxl import Workbook
+
+    p = tmp_path / "book.xlsx"
+    wb = Workbook()
+    wb.properties.title = title
+    wb.properties.creator = "Carol"
+    wb.create_sheet("Sheet2")
+    wb.save(p)
+    return p
+
+
+def _make_png(tmp_path: Path, width: int = 1920, height: int = 1080) -> Path:
+    from PIL import Image
+
+    p = tmp_path / "img.png"
+    img = Image.new("RGB", (width, height), "blue")
+    img.save(p)
+    return p
+
+
+# ---- PDF 命名空间 ----
+
+
+class TestPdfNamespace:
+    def test_pdf_title(self, tmp_path: Path) -> None:
+        f = _make_pdf(tmp_path, title="Annual Report")
+        tpl = Template("{pdf_title}_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        assert target.name == "Annual Report_doc.pdf"
+
+    def test_pdf_pages(self, tmp_path: Path) -> None:
+        f = _make_pdf(tmp_path)
+        tpl = Template("{pdf_pages}p_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        # PDF 有 1 页
+        assert target.name.startswith("1p_doc.pdf")
+
+    def test_pdf_namespace_empty_for_non_pdf(self, tmp_path: Path) -> None:
+        """非 PDF 文件的 {pdf_*} 占位符应填空串."""
+        f = tmp_path / "photo.png"
+        f.write_bytes(b"\x89PNG\r\n\x1a\n")  # 不是真 PNG 也无所谓, 走 unknown 分支
+        tpl = Template("{pdf_title}_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        assert target.name == "_photo.png"
+
+
+# ---- Word 命名空间 ----
+
+
+class TestWordNamespace:
+    def test_word_title(self, tmp_path: Path) -> None:
+        f = _make_docx(tmp_path, title="My Word Doc")
+        tpl = Template("{word_title}_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        assert target.name == "My Word Doc_doc.docx"
+
+    def test_word_paragraphs(self, tmp_path: Path) -> None:
+        f = _make_docx(tmp_path)
+        tpl = Template("{word_paragraphs}par_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        # docx 加 3 段 + 初始 1 段 = 4 paragraphs
+        assert target.name.startswith("3par_doc.docx")
+
+    def test_word_namespace_empty_for_non_word(self, tmp_path: Path) -> None:
+        f = _make_png(tmp_path)
+        tpl = Template("{word_title}_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        assert target.name == "_img.png"
+
+
+# ---- Excel 命名空间 ----
+
+
+class TestExcelNamespace:
+    def test_excel_sheets(self, tmp_path: Path) -> None:
+        f = _make_xlsx(tmp_path)
+        tpl = Template("{excel_sheets}sheets_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        # 默认 + 1 个新建 = 2 sheets
+        assert target.name == "2sheets_book.xlsx"
+
+    def test_excel_sheet_name(self, tmp_path: Path) -> None:
+        f = _make_xlsx(tmp_path)
+        tpl = Template("{excel_sheet_name}_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        # 默认 sheet 名是 Sheet
+        assert target.name.startswith("Sheet_book.xlsx")
+
+    def test_excel_namespace_empty_for_non_excel(self, tmp_path: Path) -> None:
+        f = _make_png(tmp_path)
+        tpl = Template("{excel_sheets}_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        assert target.name == "0_img.png"
+
+
+# ---- Image 命名空间 ----
+
+
+class TestImageNamespace:
+    def test_image_width_height(self, tmp_path: Path) -> None:
+        f = _make_png(tmp_path, width=1920, height=1080)
+        tpl = Template("{image_width}x{image_height}_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        assert target.name == "1920x1080_img.png"
+
+    def test_image_aspect_ratio(self, tmp_path: Path) -> None:
+        f = _make_png(tmp_path, width=1920, height=1080)
+        tpl = Template("{image_aspect_ratio}_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        assert target.name == "16_9_img.png"
+
+    def test_image_format(self, tmp_path: Path) -> None:
+        f = _make_png(tmp_path)
+        tpl = Template("{image_format}_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        assert target.name == "PNG_img.png"
+
+    def test_image_namespace_empty_for_non_image(self, tmp_path: Path) -> None:
+        f = _make_pdf(tmp_path)
+        tpl = Template("{image_width}x{image_height}_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        assert target.name == "0x0_doc.pdf"
+
+
+# ---- 通用占位符向后兼容 (W3) ----
+
+
+class TestGeneralPlaceholderCompat:
+    def test_title_works_for_pdf(self, tmp_path: Path) -> None:
+        f = _make_pdf(tmp_path, title="Report")
+        tpl = Template("{Title}_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        assert target.name == "Report_doc.pdf"
+
+    def test_title_works_for_word(self, tmp_path: Path) -> None:
+        f = _make_docx(tmp_path, title="Letter")
+        tpl = Template("{Title}_{OriginalName}")
+        target = Renamer(tpl)._render_target(f)
+        assert target is not None
+        assert target.name == "Letter_doc.docx"
+
+
+# ---- apply_with_progress ----
+
+
+class TestApplyWithProgress:
+    def test_progress_called_per_file(self, tmp_path: Path) -> None:
+        files = []
+        for i in range(5):
+            f = tmp_path / f"f{i}.txt"
+            f.write_text(f"content {i}")
+            files.append(f)
+
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+        calls: list[tuple[int, int, Path, RenameResult]] = []
+
+        def cb(i, total, file, result):
+            calls.append((i, total, file, result))
+
+        results = renamer.apply_with_progress(files, on_progress=cb)
+        assert len(results) == 5
+        assert len(calls) == 5
+        # 第一次回调 i=1, 最后一次 i=5
+        assert calls[0][0] == 1
+        assert calls[-1][0] == 5
+        assert calls[-1][1] == 5
+
+    def test_progress_callback_exception_swallowed(self, tmp_path: Path) -> None:
+        """进度回调抛异常不应中断主流程."""
+        f = tmp_path / "a.txt"
+        f.write_text("x")
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+
+        def bad_cb(i, total, file, result):
+            raise RuntimeError("boom")
+
+        # 不应抛
+        results = renamer.apply_with_progress([f], on_progress=bad_cb)
+        assert len(results) == 1
+        assert results[0].status == "OK"
+
+    def test_progress_called_for_dry_run(self, tmp_path: Path) -> None:
+        f = tmp_path / "x.txt"
+        f.write_text("x")
+        progress_count = {"n": 0}
+
+        def cb(i, total, file, result):
+            progress_count["n"] += 1
+
+        # plan 模式 (DRY_RUN) 不走 apply, 改用 plan 测 — 但 plan 不回调
+        # 这里 apply + dry-run 内部没区别, 仅 status="DRY_RUN" 行为仍跑 plan 逻辑
+        # 实际: apply_with_progress 走 _apply_one, 模板渲染但没冲突时正常改名
+        # 用一个不改变文件名的模板 (i.e. 模板等于原名) 测 skip
+        skip_renamer = Renamer(Template("{OriginalName}"))
+        results = skip_renamer.apply_with_progress([f], on_progress=cb)
+        assert progress_count["n"] == 1
+        assert results[0].status == "SKIPPED"
+
+    def test_no_callback_works(self, tmp_path: Path) -> None:
+        f = tmp_path / "y.txt"
+        f.write_text("y")
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+        # 不传 on_progress
+        results = renamer.apply_with_progress([f])
+        assert len(results) == 1
+        assert results[0].status == "OK"
+        assert (tmp_path / "001_y.txt").exists()

@@ -1,12 +1,7 @@
 """命令行接口.
 
-W4 v1 实现：
-- classify 子命令：用 core/classifier.py 真实分类
-  - --json：输出 JSON 给脚本管道
-  - --copy/--move：按类别复制/移动到子目录
-  - --group：按类别分组展示
-  - --by-category：按类别目录汇总
-- rename 子命令：占位（W2 引擎已就绪，但 CLI 留 W5 集成）
+W4 v1-v5: classify / dedup-scan / dedup-action / dedup-undo
+W5: rename 真实集成（接 Renamer + 进度回调 + 3 冲突策略 + dry-run + JSON）
 """
 
 from __future__ import annotations
@@ -15,6 +10,7 @@ import argparse
 import json
 import shutil
 import sys
+import threading
 from pathlib import Path
 
 from filemaster.core.classifier import (
@@ -221,15 +217,183 @@ def _output_copy_move(
 
 
 # ============================================================
-# rename 子命令（占位，留 W5 集成）
+# W5: rename 子命令 (真实集成)
 # ============================================================
+
+_RENAME_STATUS_ZH = {
+    "OK": "成功",
+    "RENAMED": "改名",
+    "OVERWRITTEN": "覆盖",
+    "CONFLICT": "冲突",
+    "SKIPPED": "跳过",
+    "DRY_RUN": "试运行",
+    "ERROR": "失败",
+}
+
+
+def _make_progress_bar(pct: float, width: int = 30) -> str:
+    """ASCII 进度条: [████░░░░] 50%"""
+    filled = int(pct / 100 * width)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"[{bar}]"
 
 
 def _cmd_rename(args: argparse.Namespace) -> int:
-    """重命名子命令（W5 落地，目前占位）."""
-    print("[W5] rename 命令已解析，引擎在 filemaster.core.renamer，CLI 留 W5 集成")
-    print(f"  参数：{vars(args)}")
-    return 0
+    """W5: rename 真实集成.
+
+    流程: 扫描源目录 → 构造 Template + Renamer → apply_with_progress →
+    按文件逐个回调 on_progress 打进度 → 汇总统计.
+    """
+    from filemaster.core.renamer import ConflictStrategy, Renamer
+    from filemaster.core.template import Template
+    from filemaster.core.undo import UndoStack
+
+    source = Path(args.source).resolve()
+    if not source.exists():
+        print(f"❌ 源路径不存在: {source}", file=sys.stderr)
+        return 1
+
+    # 1) 解析模板
+    try:
+        tpl = Template(args.template)
+    except ValueError as e:
+        print(f"❌ 模板无效: {e}", file=sys.stderr)
+        return 1
+
+    # 2) 冲突策略
+    try:
+        conflict_strategy = ConflictStrategy(args.conflict)
+    except ValueError:
+        valid = ", ".join(s.value for s in ConflictStrategy)
+        print(f"❌ 冲突策略无效: {args.conflict} (合法: {valid})", file=sys.stderr)
+        return 1
+
+    # 3) 扫描文件: -s 可为单文件或目录 (W5 增强: 单文件模式避免 dir scan
+    #    把冲突目标也一起捞进来, 让 collision 测试可精确定位)
+    if source.is_file():
+        files = [source]
+    elif args.recursive:
+        files = sorted(p for p in source.rglob("*") if p.is_file())
+    else:
+        files = sorted(p for p in source.iterdir() if p.is_file())
+    if not files:
+        print(f"⚠️  目录无文件: {source}")
+        return 0
+
+    # 4) 构造 Renamer + UndoStack
+    renamer = Renamer(tpl, prefix=args.prefix, start_index=args.start_index)
+    undo_stack: UndoStack | None = None
+    if not args.dry_run:
+        undo_stack = UndoStack()
+
+    # JSON 模式不打 header (避免污染 stdout 让 json.loads 直接解析)
+    if not args.json:
+        mode_label = "🔍 DRY-RUN" if args.dry_run else "🚀 EXEC"
+        print(
+            f"{mode_label}  rename {len(files)} 文件 / "
+            f"模板={tpl.raw!r} 前缀={args.prefix!r} "
+            f"冲突={conflict_strategy.value} 起始序号={args.start_index}"
+        )
+
+    # 5) 进度回调 + 异步执行 (W5: 用 threading 让进度回调实时刷新,
+    #    apply_with_progress 内部仍按 1-by-1 串行跑, 保证 self._index 顺序)
+    progress_done = {"count": 0, "last_msg": ""}
+
+    def on_progress(i: int, total: int, file: Path, result) -> None:
+        progress_done["count"] = i
+        pct = i / total * 100
+        # JSON 模式不打进度条 (避免污染 stdout)
+        if args.json:
+            return
+        bar = _make_progress_bar(pct)
+        target_name = result.target.name if result.target else "(skip)"
+        status_zh = _RENAME_STATUS_ZH.get(result.status, result.status)
+        line = f"  {bar} {pct:5.1f}% ({i}/{total})  {file.name} → {target_name}  [{status_zh}]   "
+        # 截断太长 (避免 progress 乱跳)
+        if len(line) > 120:
+            line = line[:117] + "..."
+        print(f"\r{line}", end="", flush=True)
+        if i == total:
+            print()  # 结束换行
+
+    # 异步包装 — dry-run 走 plan (不动文件), 真执行走 apply_with_progress.
+    # 真正"并发"留给 W6 (ThreadPoolExecutor 分片), W5 仍串行保证 Index 正确.
+    result_holder: dict = {"results": None, "exc": None}
+
+    def _worker() -> None:
+        try:
+            if args.dry_run:
+                # plan 只生成 RenameResult, 不动文件 (status="DRY_RUN")
+                plan_results = renamer.plan(files)
+                # 把 plan 结果也通过 on_progress 走一遍, 让进度条统一
+                for i, r in enumerate(plan_results, 1):
+                    if on_progress is not None:
+                        on_progress(i, len(plan_results), r.source, r)
+                result_holder["results"] = plan_results
+            else:
+                result_holder["results"] = renamer.apply_with_progress(
+                    files, conflict_strategy, undo_stack, on_progress
+                )
+        except Exception as e:
+            result_holder["exc"] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join()
+
+    if result_holder["exc"] is not None:
+        print(f"\n❌ 重命名失败: {result_holder['exc']}", file=sys.stderr)
+        return 1
+
+    results = result_holder["results"]
+    if results is None:
+        print("❌ 重命名未产生结果", file=sys.stderr)
+        return 1
+
+    # 6) 汇总统计
+    stats = {
+        "total": len(results),
+        "ok": sum(1 for r in results if r.status in ("OK", "RENAMED", "OVERWRITTEN")),
+        "conflict": sum(1 for r in results if r.status == "CONFLICT"),
+        "skipped": sum(1 for r in results if r.status == "SKIPPED"),
+        "dry_run": sum(1 for r in results if r.status == "DRY_RUN"),
+        "error": sum(1 for r in results if r.status == "ERROR"),
+    }
+
+    # 7) 输出
+    if args.json:
+        payload = {
+            "mode": "dry-run" if args.dry_run else "exec",
+            "template": tpl.raw,
+            "prefix": args.prefix,
+            "conflict_strategy": conflict_strategy.value,
+            "stats": stats,
+            "items": [
+                {
+                    "source": str(r.source),
+                    "target": str(r.target) if r.target else None,
+                    "status": r.status,
+                    "message": r.message,
+                }
+                for r in results
+            ],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"\n📊 完成: 总数={stats['total']} "
+            f"成功={stats['ok']} 冲突跳过={stats['conflict']} "
+            f"跳过={stats['skipped']} 试运行={stats['dry_run']} 失败={stats['error']}"
+        )
+        if not args.dry_run and stats["ok"] > 0:
+            print(f"   ↩ undo:  撤销栈已记录 ({stats['ok']} 个 entry), 可用 UndoStack 恢复")
+        if stats["error"] > 0:
+            print("\n   失败明细:")
+            for r in results:
+                if r.status == "ERROR":
+                    print(f"     ✗ {r.source.name}: {r.message}")
+
+    return 0 if stats["error"] == 0 else 1
 
 
 # ============================================================
@@ -439,9 +603,9 @@ def build_parser() -> argparse.ArgumentParser:
     """构造 CLI 参数解析器."""
     parser = argparse.ArgumentParser(
         prog="filemaster",
-        description="FileMaster — 文件批量处理工具（W4 v4：Dedup 动作）",
+        description="FileMaster — 文件批量处理工具（W5: rename 集成）",
     )
-    parser.add_argument("--version", action="version", version="0.4.0")
+    parser.add_argument("--version", action="version", version="0.5.0")
 
     sub = parser.add_subparsers(dest="command", help="子命令")
 
@@ -475,16 +639,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_classify.set_defaults(func=_cmd_classify)
 
-    # ----- rename (placeholder) -----
-    p_rename = sub.add_parser("rename", help="批量重命名（W5 集成）")
+    # ----- rename (W5 真实集成) -----
+    p_rename = sub.add_parser("rename", help="批量重命名（W5: 真实集成）")
     p_rename.add_argument("-s", "--source", required=True, help="源目录")
-    p_rename.add_argument("-p", "--prefix", default="", help="前缀")
     p_rename.add_argument(
         "-t", "--template",
-        default="{Prefix}{OriginalName}",
-        help="命名模板",
+        default="{Prefix}{Index:D3}_{OriginalName}",
+        help="命名模板 (默认 {Prefix}{Index:D3}_{OriginalName})",
     )
-    p_rename.add_argument("--dry-run", action="store_true", help="试运行")
+    p_rename.add_argument("-p", "--prefix", default="", help="前缀")
+    p_rename.add_argument(
+        "--start-index", type=int, default=1, help="起始序号 (默认 1)"
+    )
+    p_rename.add_argument(
+        "-r", "--recursive", action="store_true", help="递归子目录"
+    )
+    p_rename.add_argument(
+        "--conflict",
+        default="skip",
+        choices=["skip", "overwrite", "rename_new"],
+        help="冲突策略 (默认 skip)",
+    )
+    p_rename.add_argument(
+        "--dry-run", action="store_true", help="试运行 (不真改, 只列计划)"
+    )
+    p_rename.add_argument(
+        "--json", action="store_true", help="输出 JSON (便于脚本管道)"
+    )
     p_rename.set_defaults(func=_cmd_rename)
 
     # ----- dedup-scan (W4 v4) -----

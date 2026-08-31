@@ -1,8 +1,10 @@
-"""Metadata 读取器测试 (W3).
+"""Metadata 读取器测试 (W3 + W5 扩展).
 
-覆盖 4 类文件（PDF/Word/Excel/Image）的基础字段读取、缺失字段兜底、
-损坏/不存在文件优雅降级，以及批量读取。每个 test 动态造 fixture，
-不依赖外部文件。
+W3 覆盖 4 类文件（PDF/Word/Excel/Image）的基础字段读取、缺失字段兜底、
+损坏/不存在文件优雅降级，以及批量读取。
+W5 覆盖新增字段：word_paragraphs / excel_sheets_count /
+image_taken_at / image_camera_make / image_camera_model /
+image_format / image_aspect_ratio / _compute_aspect_ratio.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from filemaster.core.metadata import FileMetadata, MetadataReader
+from filemaster.core.metadata import FileMetadata, MetadataReader, _compute_aspect_ratio
 
 # ---------- fixture 构造函数 ----------
 
@@ -28,34 +30,69 @@ def _make_pdf(tmp_path: Path, title: str = "Annual Report 2026", author: str = "
     return p
 
 
-def _make_docx(tmp_path: Path, title: str = "Doc Title", author: str = "Doc Author") -> Path:
+def _make_docx(tmp_path: Path, title: str = "Doc Title", author: str = "Doc Author", paragraphs: int = 3) -> Path:
     from docx import Document
 
     p = tmp_path / "test.docx"
     doc = Document()
     doc.core_properties.title = title
     doc.core_properties.author = author
+    # 加 N 段 (默认段落不计 core_properties, 用 add_paragraph 加新段)
+    for i in range(paragraphs):
+        doc.add_paragraph(f"段落 {i}")
     doc.save(p)
     return p
 
 
-def _make_xlsx(tmp_path: Path, title: str = "Sheet Report", creator: str = "xlsAuthor") -> Path:
+def _make_xlsx(tmp_path: Path, title: str = "Sheet Report", creator: str = "xlsAuthor", sheets: int = 2) -> Path:
     from openpyxl import Workbook
 
     p = tmp_path / "test.xlsx"
     wb = Workbook()
     wb.properties.title = title
     wb.properties.creator = creator
+    # 默认有 1 个 sheet, 加 N 个
+    for i in range(sheets - 1):
+        wb.create_sheet(f"Sheet{i+2}")
     wb.save(p)
     return p
 
 
-def _make_image(tmp_path: Path, width: int = 200, height: int = 100) -> Path:
+def _make_image(
+    tmp_path: Path,
+    width: int = 200,
+    height: int = 100,
+    with_exif: bool = False,
+) -> Path:
     from PIL import Image
 
     p = tmp_path / "test.png"
     img = Image.new("RGB", (width, height), "red")
+    if with_exif:
+        from PIL.ExifTags import TAGS
+
+        exif = img.getexif()
+        # TAGS[271] = Make, TAGS[272] = Model, TAGS[306] = DateTime, TAGS[36867] = DateTimeOriginal
+        exif[271] = "Canon"
+        exif[272] = "EOS R5"
+        exif[306] = "2026:07:15 10:30:00"
+        exif[36867] = "2026:07:15 10:30:00"
     img.save(p)
+    return p
+
+
+def _make_jpeg_with_exif(tmp_path: Path) -> Path:
+    """造一个带 EXIF 的 JPEG (PNG 不存 EXIF, 测 EXIF 解析必须用 JPEG)."""
+    from PIL import Image
+
+    p = tmp_path / "test.jpg"
+    img = Image.new("RGB", (640, 480), "blue")
+    exif = img.getexif()
+    exif[271] = "Canon"   # Make
+    exif[272] = "EOS R5"  # Model
+    exif[306] = "2026:07:15 10:30:00"     # DateTime
+    exif[36867] = "2026:07:15 10:30:00"  # DateTimeOriginal
+    img.save(p, "JPEG", exif=exif)
     return p
 
 
@@ -124,6 +161,12 @@ class TestWordMetadata:
         assert m.title == ""
         assert m.author == ""
 
+    def test_paragraphs_count(self, reader: MetadataReader, tmp_path: Path) -> None:
+        """W5: {word_paragraphs} 字段."""
+        p = _make_docx(tmp_path, paragraphs=5)
+        m = reader.read(p)
+        assert m.paragraphs == 5  # add_paragraph 5 次
+
 
 # ---------- Excel ----------
 
@@ -150,6 +193,12 @@ class TestExcelMetadata:
         m = reader.read(p)
         assert m.title == ""
 
+    def test_sheets_count(self, reader: MetadataReader, tmp_path: Path) -> None:
+        """W5: {excel_sheets} 字段."""
+        p = _make_xlsx(tmp_path, sheets=3)
+        m = reader.read(p)
+        assert m.sheets_count == 3
+
 
 # ---------- Image ----------
 
@@ -174,6 +223,65 @@ class TestImageMetadata:
         p.write_bytes(b"not an image")
         m = reader.read(p)
         assert m.title == ""
+
+    def test_width_height_format(self, reader: MetadataReader, tmp_path: Path) -> None:
+        """W5: {image_width}/{image_height}/{image_format} 字段."""
+        p = _make_image(tmp_path, width=640, height=360)
+        m = reader.read(p)
+        assert m.width == 640
+        assert m.height == 360
+        assert m.image_format == "PNG"
+
+    def test_with_exif_jpeg(self, reader: MetadataReader, tmp_path: Path) -> None:
+        """W5: EXIF (JPEG 容器) 写入 Make/Model/DateTime/DateTimeOriginal 后能读出."""
+        p = _make_jpeg_with_exif(tmp_path)
+        m = reader.read(p)
+        assert m.camera_make == "Canon"
+        assert m.camera_model == "EOS R5"
+        # taken_at 优先取 DateTimeOriginal
+        assert m.taken_at == "2026:07:15 10:30:00"
+        # created 落 DateTime (无 DateTimeOriginal 时也用 DateTime)
+        assert m.created == "2026:07:15 10:30:00"
+
+    def test_aspect_ratio_16_9(self, reader: MetadataReader, tmp_path: Path) -> None:
+        """W5: {image_aspect_ratio} 字段 — 16:9."""
+        p = _make_image(tmp_path, width=1920, height=1080)
+        m = reader.read(p)
+        assert m.aspect_ratio == "16:9"
+
+    def test_aspect_ratio_4_3(self, reader: MetadataReader, tmp_path: Path) -> None:
+        p = _make_image(tmp_path, width=800, height=600)
+        m = reader.read(p)
+        assert m.aspect_ratio == "4:3"
+
+    def test_aspect_ratio_1_1(self, reader: MetadataReader, tmp_path: Path) -> None:
+        p = _make_image(tmp_path, width=500, height=500)
+        m = reader.read(p)
+        assert m.aspect_ratio == "1:1"
+
+
+# ---------- _compute_aspect_ratio 纯函数 ----------
+
+
+class TestComputeAspectRatio:
+    def test_16_9(self) -> None:
+        assert _compute_aspect_ratio(1920, 1080) == "16:9"
+
+    def test_4_3(self) -> None:
+        assert _compute_aspect_ratio(800, 600) == "4:3"
+
+    def test_1_1(self) -> None:
+        assert _compute_aspect_ratio(500, 500) == "1:1"
+
+    def test_zero_returns_empty(self) -> None:
+        assert _compute_aspect_ratio(0, 100) == ""
+        assert _compute_aspect_ratio(100, 0) == ""
+
+    def test_uncommon_ratio_returns_decimal(self) -> None:
+        # 1000 / 541 ≈ 1.85, 不匹配任何常用比例, 返 "1.85:1"
+        result = _compute_aspect_ratio(1000, 541)
+        assert result.endswith(":1")
+        assert ":" in result
 
 
 # ---------- 未知扩展名 ----------
@@ -249,6 +357,16 @@ def test_filemetadata_default_values() -> None:
     assert m.created == ""
     assert m.modified == ""
     assert m.page_count == 0
+    # W5 新字段默认值
+    assert m.paragraphs == 0
+    assert m.sheets_count == 0
+    assert m.taken_at == ""
+    assert m.camera_make == ""
+    assert m.camera_model == ""
+    assert m.image_format == ""
+    assert m.width == 0
+    assert m.height == 0
+    assert m.aspect_ratio == ""
     assert m.extra == {}
 
 

@@ -350,3 +350,201 @@ class TestDedupUndoCLI:
         r = _run("dedup-undo", "restore", str(log_path), env=env)
         assert r.returncode == 1
         assert "不可恢复" in r.stdout
+
+
+
+# ============================================================
+# W5: rename CLI 子命令测试
+# ============================================================
+
+
+class TestRenameBasic:
+    def test_rename_dry_run_keeps_files(self, tmp_path: Path) -> None:
+        """--dry-run 不动文件."""
+        f = tmp_path / "doc.txt"
+        f.write_text("hello")
+        r = _run("rename", "-s", str(tmp_path), "-t", "{Index:D3}_{OriginalName}", "--dry-run")
+        assert r.returncode == 0
+        assert f.exists()  # 原文件还在
+        assert not (tmp_path / "001_doc.txt").exists()
+
+    def test_rename_real_exec(self, tmp_path: Path) -> None:
+        """真执行, 旧文件消失, 新文件存在."""
+        f = tmp_path / "doc.txt"
+        f.write_text("hello")
+        r = _run("rename", "-s", str(tmp_path), "-t", "{Index:D3}_{OriginalName}")
+        assert r.returncode == 0
+        assert not f.exists()
+        assert (tmp_path / "001_doc.txt").exists()
+
+    def test_rename_with_prefix(self, tmp_path: Path) -> None:
+        f = tmp_path / "doc.txt"
+        f.write_text("x")
+        r = _run("rename", "-s", str(tmp_path), "-t", "{Prefix}{Index}_{OriginalName}", "-p", "pre_")
+        assert r.returncode == 0
+        assert (tmp_path / "pre_1_doc.txt").exists()
+
+    def test_rename_index_padding(self, tmp_path: Path) -> None:
+        files = []
+        for i in range(3):
+            f = tmp_path / f"f{i}.txt"
+            f.write_text("x")
+            files.append(f)
+        r = _run("rename", "-s", str(tmp_path), "-t", "{Index:D3}_{OriginalName}")
+        assert r.returncode == 0
+        # 排序后第一个是 f0.txt, 应改成 001_f0.txt
+        assert (tmp_path / "001_f0.txt").exists()
+        assert (tmp_path / "002_f1.txt").exists()
+        assert (tmp_path / "003_f2.txt").exists()
+
+    def test_rename_recursive(self, tmp_path: Path) -> None:
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        f1 = tmp_path / "a.txt"
+        f1.write_text("x")
+        f2 = sub / "b.txt"
+        f2.write_text("x")
+        r = _run("rename", "-s", str(tmp_path), "-t", "{Index:D3}_{OriginalName}", "-r")
+        assert r.returncode == 0
+        assert (tmp_path / "001_a.txt").exists()
+        assert (sub / "002_b.txt").exists()
+
+
+class TestRenameConflict:
+    def test_rename_collision_skip_default(self, tmp_path: Path) -> None:
+        """冲突默认 skip, 目标已存在则不覆盖.
+
+        W5 修复: 用单文件源 (W5 CLI 支持 -s 直接接受单文件), 避免
+        dir scan 把冲突目标 001_doc.txt 也一起捞进来处理.
+        """
+        f = tmp_path / "doc.txt"
+        f.write_text("new")
+        # 提前建一个 001_doc.txt (冲突目标)
+        (tmp_path / "001_doc.txt").write_text("existing")
+        r = _run("rename", "-s", str(f), "-t", "{Index:D3}_{OriginalName}")
+        assert r.returncode == 0
+        # 原文件保留 (skip 策略)
+        assert f.exists()
+        # 目标文件内容不变
+        assert (tmp_path / "001_doc.txt").read_text() == "existing"
+
+    def test_rename_collision_overwrite(self, tmp_path: Path) -> None:
+        f = tmp_path / "doc.txt"
+        f.write_text("new")
+        (tmp_path / "001_doc.txt").write_text("existing")
+        r = _run(
+            "rename", "-s", str(f),
+            "-t", "{Index:D3}_{OriginalName}",
+            "--conflict", "overwrite",
+        )
+        assert r.returncode == 0
+        assert not f.exists()
+        assert (tmp_path / "001_doc.txt").read_text() == "new"
+
+    def test_rename_collision_rename_new(self, tmp_path: Path) -> None:
+        f = tmp_path / "doc.txt"
+        f.write_text("new")
+        (tmp_path / "001_doc.txt").write_text("existing")
+        r = _run(
+            "rename", "-s", str(f),
+            "-t", "{Index:D3}_{OriginalName}",
+            "--conflict", "rename_new",
+        )
+        assert r.returncode == 0
+        assert not f.exists()
+        # rename_new 在 stem 后追加 (1), target=001_doc.txt → 新名 001_doc (1).txt
+        assert (tmp_path / "001_doc (1).txt").exists()
+        # 原冲突目标保留
+        assert (tmp_path / "001_doc.txt").exists()
+
+
+class TestRenameOutput:
+    def test_rename_json_output(self, tmp_path: Path) -> None:
+        """W5: --json + --dry-run 模式输出纯 JSON, 进度条不打."""
+        f = tmp_path / "a.txt"
+        f.write_text("x")
+        r = _run(
+            "rename", "-s", str(tmp_path),
+            "-t", "{Index:D3}_{OriginalName}",
+            "--dry-run", "--json",
+        )
+        assert r.returncode == 0
+        data = json.loads(r.stdout)
+        assert "stats" in data
+        assert "items" in data
+        assert data["stats"]["total"] == 1
+        assert data["mode"] == "dry-run"
+        # 进度回调在 JSON 模式不输出, stdout 应是纯 JSON
+        assert r.stdout.startswith("{")
+
+    def test_rename_human_output(self, tmp_path: Path) -> None:
+        f = tmp_path / "a.txt"
+        f.write_text("x")
+        r = _run(
+            "rename", "-s", str(tmp_path),
+            "-t", "{Index:D3}_{OriginalName}",
+        )
+        assert r.returncode == 0
+        # 人类可读输出应含 📊 完成:
+        assert "📊 完成" in r.stdout or "完成:" in r.stdout
+
+
+class TestRenameErrors:
+    def test_rename_nonexistent_source(self, tmp_path: Path) -> None:
+        r = _run("rename", "-s", str(tmp_path / "no_such"), "-t", "{OriginalName}")
+        assert r.returncode == 1
+        # 错误信息走 stderr (跟 grep/dedup CLI 一致)
+        assert "不存在" in r.stderr
+
+    def test_rename_empty_dir(self, tmp_path: Path) -> None:
+        r = _run("rename", "-s", str(tmp_path), "-t", "{OriginalName}")
+        assert r.returncode == 0
+        assert "无文件" in r.stdout
+
+    def test_rename_invalid_conflict(self, tmp_path: Path) -> None:
+        """argparse 会直接拦截非法 --conflict 值, returncode=2."""
+        f = tmp_path / "a.txt"
+        f.write_text("x")
+        r = _run(
+            "rename", "-s", str(tmp_path),
+            "-t", "{OriginalName}",
+            "--conflict", "wrong_value",
+        )
+        assert r.returncode == 2
+        assert "invalid choice" in r.stderr
+
+
+class TestRenameNamespacedPlaceholder:
+    def test_rename_pdf_namespace(self, tmp_path: Path) -> None:
+        """W5: {pdf_title} 占位符端到端."""
+        try:
+            import fitz
+        except ImportError:
+            pytest.skip("PyMuPDF not installed")
+        p = tmp_path / "report.pdf"
+        import fitz
+        doc = fitz.open()
+        doc.new_page()
+        doc.set_metadata({"title": "Annual"})
+        doc.save(p)
+        doc.close()
+
+        r = _run("rename", "-s", str(tmp_path), "-t", "{pdf_title}_{OriginalName}")
+        assert r.returncode == 0
+        assert (tmp_path / "Annual_report.pdf").exists()
+        assert not p.exists()
+
+    def test_rename_image_aspect_ratio(self, tmp_path: Path) -> None:
+        """W5: {image_aspect_ratio} 占位符端到端."""
+        try:
+            from PIL import Image
+        except ImportError:
+            pytest.skip("Pillow not installed")
+        p = tmp_path / "img.png"
+        from PIL import Image
+        Image.new("RGB", (1920, 1080), "red").save(p)
+
+        r = _run("rename", "-s", str(tmp_path), "-t", "{image_aspect_ratio}_{OriginalName}")
+        assert r.returncode == 0
+        # ":" 被 renamer.sanitize 替换成 "_" (Windows 非法字符)
+        assert (tmp_path / "16_9_img.png").exists()
