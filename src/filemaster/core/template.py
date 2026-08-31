@@ -28,6 +28,10 @@
 - {ImageWidth}      图片宽度（像素，非图片返 0）
 - {ImageHeight}     图片高度（像素，非图片返 0）
 
+**分类（W4 v1 新增，由 Classifier 注入 context）**
+- {Category}        文件分类（PDF/DOCUMENT/IMAGE/VIDEO/...）
+- {Category_zh}     文件分类中文标签（图片/文档/...）
+
 **预留（W9+）**
 - {Regex:pat→repl}  正则替换
 """

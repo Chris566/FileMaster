@@ -212,6 +212,20 @@ class Renamer:
                     else:
                         ctx.setdefault(k, "")
 
+        # W4 v1: 分类（lazy import — classifier 启动 0 成本但保持一致模式）
+        category_keys = {"Category", "Category_zh"}
+        if used & category_keys:
+            from filemaster.core.classifier import classify_file as _cf
+            try:
+                c = _cf(file)
+                if "Category" in used:
+                    ctx["Category"] = c.category.value
+                if "Category_zh" in used:
+                    ctx["Category_zh"] = c.category.label_zh
+            except Exception:
+                ctx.setdefault("Category", "UNKNOWN")
+                ctx.setdefault("Category_zh", "未知")
+
         return ctx
 
     def _render_target(self, file: Path) -> Path | None:

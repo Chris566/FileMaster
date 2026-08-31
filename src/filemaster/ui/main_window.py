@@ -2,6 +2,8 @@
 
 W1：3 栏布局骨架（配置 / 文件表 / 日志）+ 4 主题切换 + 工具栏 + 状态栏。
 W2：重命名引擎真实 IO 接入 + 异步任务 UI（进度条 / 取消）。
+W4 v1：Classifier 集成 — 工具栏加"📁 分类"按钮 + 中间文件表升级 QTableWidget
+       加 Category/Confidence 列 + 左侧分类组升级为按类别过滤下拉。
 """
 
 from __future__ import annotations
@@ -9,8 +11,8 @@ from __future__ import annotations
 import importlib.resources
 from pathlib import Path
 
-from PySide6.QtCore import QThread
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import Qt, QThread
+from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -18,25 +20,52 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
+from filemaster.core.classifier import (
+    Category,
+    Classification,
+    classify_batch,
+    classify_file,
+)
 from filemaster.core.renamer import ConflictStrategy
 from filemaster.core.template import Template
 from filemaster.core.undo import UndoStack
 from filemaster.io.config import Config, default_config_dir
 from filemaster.workers.batch import BatchWorker
+from filemaster.workers.classify import ClassifyWorker
+
+# Category 颜色映射（GUI 表格列染色）
+CATEGORY_COLORS: dict[Category, QColor] = {
+    Category.PDF: QColor("#FF6B6B"),
+    Category.DOCUMENT: QColor("#4ECDC4"),
+    Category.SPREADSHEET: QColor("#95E1D3"),
+    Category.PRESENTATION: QColor("#F38181"),
+    Category.IMAGE: QColor("#AA96DA"),
+    Category.VIDEO: QColor("#FCBAD3"),
+    Category.AUDIO: QColor("#A8D8EA"),
+    Category.ARCHIVE: QColor("#FFFFD2"),
+    Category.CODE: QColor("#3D5A80"),
+    Category.CONFIG: QColor("#98C1D9"),
+    Category.OTHER: QColor("#CCCCCC"),
+    Category.UNKNOWN: QColor("#EEEEEE"),
+}
 
 
 class MainWindow(QMainWindow):
@@ -49,22 +78,31 @@ class MainWindow(QMainWindow):
         "high_contrast": "高对比度",
     }
 
+    # 过滤下拉：全部 + 12 个 Category
+    FILTER_OPTIONS = ["全部"] + [c.value for c in Category]
+
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("FileMaster — 文件批量处理工具 v0.2.0 (W2)")
-        self.resize(1200, 760)
+        self.setWindowTitle("FileMaster — 文件批量处理工具 v0.3.0 (W4)")
+        self.resize(1280, 800)
 
         # 加载配置
         self._config = Config.load()
         self._theme_name = self._config.theme
 
-        # W2：撤销栈（持久化到配置目录/undo）
+        # 撤销栈
         cfg_dir = default_config_dir()
         self._undo_stack = UndoStack(persist_dir=cfg_dir / "undo")
 
-        # W2：线程/Worker 状态
+        # W2：线程/Worker 状态（重命名）
         self._thread: QThread | None = None
         self._worker: BatchWorker | None = None
+
+        # W4 v1：分类线程/Worker
+        self._classify_thread: QThread | None = None
+        self._classify_worker: ClassifyWorker | None = None
+        # 当前表格里的所有分类结果（过滤时复用）
+        self._all_classifications: list[Classification] = []
 
         # 构造 UI
         self._build_menu()
@@ -93,6 +131,14 @@ class MainWindow(QMainWindow):
         m_edit = menubar.addMenu("编辑(&E)")
         m_edit.addAction(self._make_action("撤销(&Z)", "Ctrl+Z", self._on_undo))
         m_edit.addAction(self._make_action("重做(&Y)", "Ctrl+Y", self._on_redo))
+
+        m_classify = menubar.addMenu("分类(&C)")
+        m_classify.addAction(self._make_action(
+            "📁 分类到子目录(&C)...", "Ctrl+Shift+C", self._on_classify
+        ))
+        m_classify.addAction(self._make_action(
+            "📊 扫描并预览分类(&P)", "", self._on_load_files_to_table
+        ))
 
         m_view = menubar.addMenu("视图(&V)")
         m_theme = m_view.addMenu("主题")
@@ -123,6 +169,19 @@ class MainWindow(QMainWindow):
         self._btn_undo.setShortcut(QKeySequence("Ctrl+Z"))
         self._btn_undo.clicked.connect(self._on_undo)
         tb.addWidget(self._btn_undo)
+
+        tb.addSeparator()
+
+        # W4 v1：分类按钮
+        self._btn_classify = QPushButton("📁 分类")
+        self._btn_classify.setToolTip("按文件类型分类复制/移动到子目录（Ctrl+Shift+C）")
+        self._btn_classify.clicked.connect(self._on_classify)
+        tb.addWidget(self._btn_classify)
+
+        self._btn_scan = QPushButton("📊 预览")
+        self._btn_scan.setToolTip("扫描源目录并在中间表格预览分类结果")
+        self._btn_scan.clicked.connect(self._on_load_files_to_table)
+        tb.addWidget(self._btn_scan)
 
         tb.addSeparator()
 
@@ -163,7 +222,7 @@ class MainWindow(QMainWindow):
         # 左：任务配置
         root.addWidget(self._build_left_panel(), stretch=2)
 
-        # 中：文件预览表
+        # 中：文件预览表（W4 v1：升级为 QTableWidget）
         root.addWidget(self._build_center_panel(), stretch=5)
 
         # 右：日志
@@ -176,7 +235,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        # 标题
         header = QLabel("FileMaster")
         header.setProperty("role", "header")
         layout.addWidget(header)
@@ -234,7 +292,9 @@ class MainWindow(QMainWindow):
 
         muted = QLabel(
             "基础: {Prefix} {OriginalName} {BaseName} {Extension} {Index:D3}\n"
-            "W2新增: {FileSize} {FileSizeBytes} {CreatedDate} {ModifiedDate} {HashShort} {Sheet}"
+            "W2: {FileSize} {FileSizeBytes} {CreatedDate} {ModifiedDate} {HashShort} {Sheet}\n"
+            "W3: {Title} {Author} {Subject} {PageCount} {ImageWidth} {ImageHeight}\n"
+            "W4: {Category} {Category_zh}"
         )
         muted.setProperty("role", "muted")
         muted.setWordWrap(True)
@@ -242,16 +302,31 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(gb_tpl)
 
-        # 分组：分类
-        gb_cls = QGroupBox("分类")
+        # 分组：分类（W4 v1：加"按类别过滤"下拉）
+        gb_cls = QGroupBox("分类（W4 v1）")
         v_cls = QVBoxLayout(gb_cls)
+
+        # 启用分类 checkbox
         self._chk_classify = QCheckBox("启用按类型分类复制")
         self._chk_classify.setChecked(True)
         v_cls.addWidget(self._chk_classify)
-        for cat in ("PDF", "WORD", "EXCEL", "PPT", "IMAGE"):
-            cb = QCheckBox(cat)
-            cb.setChecked(True)
-            v_cls.addWidget(cb)
+
+        # 过滤下拉：表格里只显示该类别
+        h_filter = QHBoxLayout()
+        h_filter.addWidget(QLabel("过滤:"))
+        self._cmb_filter = QComboBox()
+        for opt in self.FILTER_OPTIONS:
+            self._cmb_filter.addItem(opt)
+        self._cmb_filter.currentIndexChanged.connect(self._on_filter_category)
+        h_filter.addWidget(self._cmb_filter)
+        v_cls.addLayout(h_filter)
+
+        # 类别统计标签
+        self._lbl_stats = QLabel("未扫描")
+        self._lbl_stats.setProperty("role", "muted")
+        self._lbl_stats.setWordWrap(True)
+        v_cls.addWidget(self._lbl_stats)
+
         layout.addWidget(gb_cls)
 
         # 分组：选项
@@ -262,21 +337,40 @@ class MainWindow(QMainWindow):
         self._chk_keep_ext = QCheckBox("保留原扩展名")
         self._chk_keep_ext.setChecked(True)
         v_opt.addWidget(self._chk_keep_ext)
+        self._chk_classify_recursive = QCheckBox("递归子目录")
+        self._chk_classify_recursive.setChecked(True)
+        v_opt.addWidget(self._chk_classify_recursive)
         layout.addWidget(gb_opt)
 
         layout.addStretch()
         return panel
 
     def _build_center_panel(self) -> QWidget:
-        """中间文件表."""
+        """中间文件表（W4 v1：升级为 QTableWidget）."""
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        gb = QGroupBox("文件预览（实时）")
+        gb = QGroupBox("文件预览（实时）— W4：含分类列")
         v = QVBoxLayout(gb)
+
+        # 5 列：# / 文件名 / 大小 / 分类 / 置信度
+        self._table = QTableWidget(0, 5)
+        self._table.setHorizontalHeaderLabels(["#", "文件名", "大小", "分类", "置信度"])
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        v.addWidget(self._table)
+
+        # 隐藏旧 QListWidget 兼容（W2 仍可被 _on_file_done 用作日志追加）
         self._list_files = QListWidget()
+        self._list_files.setVisible(False)  # 不显示，但保留引用
         v.addWidget(self._list_files)
+
         layout.addWidget(gb)
         return panel
 
@@ -310,7 +404,7 @@ class MainWindow(QMainWindow):
         self._progress.setMaximumWidth(220)
         self._progress.setVisible(False)
         sb.addPermanentWidget(self._progress)
-        sb.showMessage("就绪 · v0.2.0 (W2)")
+        sb.showMessage("就绪 · v0.3.0 (W4)")
 
     # ---------- 主题 ----------
 
@@ -387,12 +481,230 @@ class MainWindow(QMainWindow):
             self._sync_ui_to_config()
 
     def _scan_files(self) -> list[Path]:
-        """扫描源目录下所有文件（非递归，按 W2 简化）。"""
+        """扫描源目录下所有文件（非递归，按 W2 简化）."""
         source = self._txt_source.text().strip()
         root = Path(source)
         if not root.is_dir():
             return []
         return [p for p in sorted(root.iterdir()) if p.is_file()]
+
+    # ---------- W4 v1：分类相关 ----------
+
+    def _on_classify(self) -> None:
+        """分类子目录操作：弹确认对话框 + 启动 ClassifyWorker."""
+        source = self._txt_source.text().strip()
+        target = self._txt_target.text().strip()
+        if not source or not Path(source).is_dir():
+            QMessageBox.warning(self, "路径无效", "请先选择有效的源目录")
+            return
+        if not target:
+            QMessageBox.warning(self, "路径无效", "请先选择目标目录（分类结果会写入 <目标>/<Category>/）")
+            return
+        if Path(source).resolve() == Path(target).resolve():
+            QMessageBox.warning(
+                self, "路径冲突",
+                "源目录与目标目录相同，无法分类（会无限循环或覆盖源文件）",
+            )
+            return
+
+        # 询问复制还是移动
+        choice = QMessageBox.question(
+            self,
+            "分类模式",
+            f"将 {source} 下的文件按类型分类到 {target}\n\n"
+            f"点击 Yes 复制，点击 No 移动，点击 Cancel 取消",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if choice == QMessageBox.StandardButton.Cancel:
+            return
+        mode = "copy" if choice == QMessageBox.StandardButton.Yes else "move"
+        dry_run = self._chk_dry.isChecked()
+        recursive = self._chk_classify_recursive.isChecked()
+
+        # 启动 Worker
+        self._run_classify_worker(
+            source=Path(source),
+            destination=Path(target),
+            mode=mode,
+            recursive=recursive,
+            dry_run=dry_run,
+        )
+
+    def _run_classify_worker(
+        self, source: Path, destination: Path, mode: str,
+        recursive: bool, dry_run: bool,
+    ) -> None:
+        """启动 ClassifyWorker（异步执行）."""
+        if self._classify_thread is not None and self._classify_thread.isRunning():
+            QMessageBox.information(self, "运行中", "已有分类任务进行中，请先取消或等待完成")
+            return
+
+        self._classify_thread = QThread(self)
+        self._classify_worker = ClassifyWorker(
+            source=source,
+            destination=destination,
+            mode=mode,
+            recursive=recursive,
+            dry_run=dry_run,
+        )
+        self._classify_worker.moveToThread(self._classify_thread)
+        self._classify_thread.started.connect(self._classify_worker.run)
+        self._classify_worker.progressed.connect(self._on_classify_progress)
+        self._classify_worker.finished.connect(self._on_classify_finished)
+        self._classify_worker.failed.connect(self._on_classify_failed)
+        self._classify_thread.start()
+
+        # 进度对话框
+        verb = "复制" if mode == "copy" else "移动"
+        self._classify_dialog = QProgressDialog(
+            f"正在{verb}分类…", "取消", 0, 100, self
+        )
+        self._classify_dialog.setWindowTitle(f"FileMaster — 分类{verb}")
+        self._classify_dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._classify_dialog.setMinimumDuration(0)
+        self._classify_dialog.canceled.connect(self._on_classify_cancel)
+        self._classify_dialog.setValue(0)
+        self._classify_dialog.show()
+
+        # 禁用分类按钮
+        self._btn_classify.setEnabled(False)
+        self._btn_scan.setEnabled(False)
+
+    def _on_classify_progress(self, percent: int, message: str) -> None:
+        if hasattr(self, "_classify_dialog") and self._classify_dialog is not None:
+            self._classify_dialog.setValue(percent)
+            self._classify_dialog.setLabelText(message)
+        self.statusBar().showMessage(f"分类: {message}")
+
+    def _on_classify_finished(self, classifications: list, summary: str) -> None:
+        """分类 Worker 完成回调."""
+        self._log(summary)
+        self.statusBar().showMessage(summary[:80])
+
+        # 关闭进度对话框
+        if hasattr(self, "_classify_dialog") and self._classify_dialog is not None:
+            self._classify_dialog.setValue(100)
+            self._classify_dialog.close()
+            self._classify_dialog = None
+
+        # 更新表格
+        if classifications:
+            self._all_classifications = classifications
+            self._refresh_table()
+
+        # 收尾 UI
+        self._btn_classify.setEnabled(True)
+        self._btn_scan.setEnabled(True)
+        if self._classify_thread is not None:
+            self._classify_thread.quit()
+            self._classify_thread.wait(2000)
+        self._classify_thread = None
+        self._classify_worker = None
+
+        QMessageBox.information(self, "分类完成", summary)
+
+    def _on_classify_failed(self, file: str, error: str) -> None:
+        self._log(f"分类失败: {file} - {error}")
+
+    def _on_classify_cancel(self) -> None:
+        if self._classify_worker is not None:
+            self._classify_worker.cancel()
+            self._log("已请求取消分类，等待当前文件完成…")
+
+    def _on_load_files_to_table(self) -> None:
+        """扫描源目录并填表预览分类结果（不复制/移动）."""
+        source = self._txt_source.text().strip()
+        if not source or not Path(source).is_dir():
+            QMessageBox.warning(self, "路径无效", "请先选择有效的源目录")
+            return
+        recursive = self._chk_classify_recursive.isChecked()
+        root = Path(source)
+        if recursive:
+            files = sorted(p for p in root.rglob("*") if p.is_file())
+        else:
+            files = sorted(p for p in root.iterdir() if p.is_file())
+
+        if not files:
+            self._log(f"源目录下无文件: {source}")
+            return
+
+        self._log(f"扫描到 {len(files)} 个文件，开始分类…")
+        self._all_classifications = classify_batch(files)
+        self._refresh_table()
+        self._log(f"预览完成: {len(self._all_classifications)} 个文件已分类")
+
+    def _on_filter_category(self, index: int) -> None:
+        """过滤下拉变更：刷新表格."""
+        self._refresh_table()
+
+    def _refresh_table(self) -> None:
+        """根据 _all_classifications 和过滤下拉刷表格."""
+        if not hasattr(self, "_table") or self._table is None:
+            return
+
+        selected = self._cmb_filter.currentText() if hasattr(self, "_cmb_filter") else "全部"
+        if selected == "全部":
+            rows = self._all_classifications
+        else:
+            target_cat = Category(selected)
+            rows = [c for c in self._all_classifications if c.category == target_cat]
+
+        self._table.setRowCount(len(rows))
+        for row_idx, c in enumerate(rows):
+            # 列 0：#
+            item_idx = QTableWidgetItem(str(row_idx + 1))
+            item_idx.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table.setItem(row_idx, 0, item_idx)
+
+            # 列 1：文件名
+            item_name = QTableWidgetItem(c.source.name)
+            self._table.setItem(row_idx, 1, item_name)
+
+            # 列 2：大小
+            try:
+                size_bytes = c.source.stat().st_size
+                size_str = self._format_size(size_bytes)
+            except OSError:
+                size_str = "?"
+            item_size = QTableWidgetItem(size_str)
+            item_size.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._table.setItem(row_idx, 2, item_size)
+
+            # 列 3：分类（带颜色背景）
+            cat_text = f"{c.category.value} ({c.category.label_zh})"
+            item_cat = QTableWidgetItem(cat_text)
+            color = CATEGORY_COLORS.get(c.category, QColor("#FFFFFF"))
+            item_cat.setBackground(QBrush(color))
+            self._table.setItem(row_idx, 3, item_cat)
+
+            # 列 4：置信度
+            conf_text = f"{c.confidence:.2f}"
+            item_conf = QTableWidgetItem(conf_text)
+            item_conf.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._table.setItem(row_idx, 4, item_conf)
+
+        # 统计标签
+        if self._all_classifications:
+            from collections import Counter
+            cnt = Counter(c.category for c in self._all_classifications)
+            stats = " · ".join(f"{cat.value}: {n}" for cat, n in cnt.most_common(5))
+            if len(cnt) > 5:
+                stats += f" · +{len(cnt) - 5} 其他"
+            self._lbl_stats.setText(f"共 {len(self._all_classifications)} 个文件 · {stats}")
+        else:
+            self._lbl_stats.setText("未扫描")
+
+    @staticmethod
+    def _format_size(n: int) -> str:
+        """字节数 → 人类可读."""
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if n < 1024:
+                return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
+            n /= 1024
+        return f"{n:.1f} PB"
+
+    # ---------- W2：重命名 ----------
 
     def _on_start(self) -> None:
         """W2：启动 BatchWorker."""
@@ -416,11 +728,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "没有文件", f"源目录下没有文件：{source}")
             return
 
-        # 冲突策略
         strat_value = self._cmb_conflict.currentData()
         strategy = ConflictStrategy(strat_value) if strat_value else ConflictStrategy.SKIP
 
-        # dry-run 检查
         if self._chk_dry.isChecked():
             strategy_label = "(Dry Run)" + self._conflict_label(strategy)
         else:
@@ -430,7 +740,6 @@ class MainWindow(QMainWindow):
             f"开始: 文件={len(files)} 模板={tpl.raw!r} 前缀={self._txt_prefix.text()!r} 冲突={strategy_label}"
         )
 
-        # 启动线程
         self._thread = QThread(self)
         self._worker = BatchWorker(
             files=files,
@@ -447,7 +756,6 @@ class MainWindow(QMainWindow):
         self._worker.finished.connect(self._on_finished)
         self._thread.start()
 
-        # UI 状态
         self._btn_start.setEnabled(False)
         self._btn_cancel.setEnabled(True)
         self._progress.setValue(0)
@@ -460,12 +768,10 @@ class MainWindow(QMainWindow):
             self._log("已请求取消，等待当前文件完成后停止…")
 
     def _on_progress(self, percent: int, file: str, index: int, total: int, message: str) -> None:
-        """进度回调（在 Worker 线程 → Qt queued connection 转回主线程）."""
         self._progress.setValue(percent)
         self.statusBar().showMessage(f"{message} · {file}")
 
     def _on_file_done(self, result) -> None:
-        """单文件完成（更新预览表）."""
         try:
             name = result.target.name if result.target else result.source.name
         except Exception:
@@ -474,15 +780,12 @@ class MainWindow(QMainWindow):
         if result.message:
             line += f"  ({result.message})"
         self._list_files.addItem(line)
-        # 滚动到底
         self._list_files.scrollToBottom()
 
     def _on_failed(self, file: str, error: str) -> None:
         self._log(f"失败: {file} - {error}")
 
     def _on_finished(self, results) -> None:
-        """任务结束."""
-        # 统计
         total = len(results)
         ok = sum(1 for r in results if r.status in ("OK", "RENAMED", "OVERWRITTEN"))
         conflict = sum(1 for r in results if r.status == "CONFLICT")
@@ -493,28 +796,33 @@ class MainWindow(QMainWindow):
         )
         self.statusBar().showMessage(f"完成 · 成功 {ok}/{total}")
 
-        # 收尾 UI
         self._progress.setVisible(False)
         self._btn_start.setEnabled(True)
         self._btn_cancel.setEnabled(False)
-        # 清 Worker 引用
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait(2000)
         self._thread = None
         self._worker = None
 
-    def closeEvent(self, event) -> None:  # type: ignore[override]  # noqa: N802 (PySide6 约定)
+    def closeEvent(self, event) -> None:  # type: ignore[override]  # noqa: N802
         """窗口关闭时清理线程."""
         if self._thread is not None and self._thread.isRunning():
             if self._worker is not None:
                 self._worker.cancel()
             self._thread.quit()
             self._thread.wait(2000)
+        if self._classify_thread is not None and self._classify_thread.isRunning():
+            if self._classify_worker is not None:
+                self._classify_worker.cancel()
+            self._classify_thread.quit()
+            self._classify_thread.wait(2000)
         super().closeEvent(event)
 
+    # ---------- 撤销 / 关于 ----------
+
     def _on_undo(self) -> None:
-        """W5 详细实现：撤销栈。当前 W2 简化：只支持 Renamer 写入的 RENAME_ONLY。"""
+        """W5 详细实现."""
         batch = self._undo_stack.pop()
         if not batch:
             self._log("撤销栈为空")
@@ -524,7 +832,6 @@ class MainWindow(QMainWindow):
         for entry in batch:
             try:
                 if entry.operation == "RenameOnly" and entry.target and entry.source:
-                    # 还原：target 改回 source 名字
                     if entry.target.exists():
                         entry.target.rename(entry.source)
                         self._log(f"撤销: {entry.target.name} → {entry.source.name}")
@@ -548,9 +855,10 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "关于 FileMaster",
-            f"<h3>FileMaster v0.2.0 (W2)</h3>"
+            f"<h3>FileMaster v0.3.0 (W4)</h3>"
             f"<p>文件批量处理工具</p>"
             f"<p>Python + PySide6 + openpyxl + PyMuPDF</p>"
+            f"<p>W4: Classifier 集成（11 类 + magic bytes）</p>"
             f"<p>配置目录: <code>{cfg_dir}</code></p>"
             f"<p>撤销栈深度: {len(self._undo_stack)}</p>"
             f"<p>© 2026 ECAS 技术开发科 · MIT License</p>",
@@ -559,8 +867,6 @@ class MainWindow(QMainWindow):
     # ---------- 工具 ----------
 
     def _log(self, msg: str) -> None:
-        """写一条日志到右侧."""
         from datetime import datetime
-
         stamp = datetime.now().strftime("%H:%M:%S")
         self._txt_log.append(f"[{stamp}] {msg}")
