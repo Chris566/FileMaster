@@ -513,6 +513,43 @@ class TestPreviewWorker:
         # 至少要保证没崩
         assert len(succeeded) + len(failed) == 1
 
+    def test_cancel_before_run(self, sample_txt: Path, qtbot) -> None:
+        """W8: 预取消, 不会发 succeeded, 应该发 cancelled()."""
+        from PySide6.QtCore import QThread, QTimer
+
+        from filemaster.workers.preview import PreviewWorker
+
+        thread = QThread()
+        worker = PreviewWorker(sample_txt)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        succeeded: list = []
+        failed: list = []
+        cancelled_count: list[int] = []
+        worker.succeeded.connect(lambda m, c: succeeded.append((m, c)))
+        worker.failed.connect(lambda p, e: failed.append((p, e)))
+        worker.cancelled.connect(lambda: cancelled_count.append(1))
+        worker.finished.connect(thread.quit)
+
+        worker.cancel()  # 预取消
+        thread.start()
+        QTimer.singleShot(3000, thread.quit)
+        qtbot.waitUntil(lambda: not thread.isRunning(), timeout=4000)
+
+        assert len(succeeded) == 0
+        assert len(failed) == 0
+        assert len(cancelled_count) == 1  # W8: emit cancelled()
+
+    def test_cancellation_token_property(self, sample_txt: Path) -> None:
+        """W8: 暴露 cancellation_token 属性."""
+        from filemaster.workers.preview import PreviewWorker
+
+        worker = PreviewWorker(sample_txt)
+        assert worker.cancellation_token.is_cancelled is False
+        worker.cancel()
+        assert worker.cancellation_token.is_cancelled is True
+
 
 # ============================================================
 # MainWindow 集成（W4 v2）

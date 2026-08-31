@@ -971,6 +971,7 @@ class MainWindow(QMainWindow):
         self._preview_thread.started.connect(self._preview_worker.run)
         self._preview_worker.succeeded.connect(self._on_preview_succeeded)
         self._preview_worker.failed.connect(self._on_preview_failed)
+        self._preview_worker.cancelled.connect(self._on_preview_cancelled)  # W8
         self._preview_worker.finished.connect(self._on_preview_finished)
         self._preview_thread.start()
 
@@ -1066,6 +1067,15 @@ class MainWindow(QMainWindow):
         self._stack_preview.setCurrentIndex(2)
         self._log(f"预览失败: {path} - {error}")
 
+    def _on_preview_cancelled(self) -> None:
+        """W8: 单文件预览取消 — 用户切到下一行, 当前预览主动放弃.
+
+        单文件语义, 没有"已处理 N 个"概念, 所以无参数.
+        不需要刷 UI 状态 (succeeded 不会再发, 自然显示空),
+        只在日志里标记一下, 方便排查.
+        """
+        self._log("⏹ 预览已取消 · 用户切到下一行")
+
     def _on_preview_finished(self) -> None:
         """PreviewWorker 结束 → 清理 thread 引用."""
         if self._preview_thread is not None:
@@ -1119,6 +1129,7 @@ class MainWindow(QMainWindow):
         self._dedup_worker.progressed.connect(self._on_dedup_progressed)
         self._dedup_worker.finished.connect(self._on_dedup_finished)
         self._dedup_worker.failed.connect(self._on_dedup_failed)
+        self._dedup_worker.cancelled.connect(self._on_dedup_cancelled)  # W8: 协作式取消信号
         self._dedup_thread.start()
 
         # UI 状态
@@ -1131,6 +1142,18 @@ class MainWindow(QMainWindow):
     def _on_dedup_progressed(self, percent: int, message: str) -> None:
         self._progress.setValue(percent)
         self.statusBar().showMessage(f"去重: {message}")
+
+    def _on_dedup_cancelled(self, processed_count: int) -> None:
+        """W8: 取消信号 — 走 CancellationToken 模式, 跟 batch worker 一致.
+
+        只刷 UI 状态, 真正的 thread 清理交给 _on_dedup_finished
+        (dedup worker 取消后照样发 finished, 因为 cancelled 是单独信号).
+        """
+        self._log(f"⏹ 去重已取消 · 已处理 {processed_count} 个文件, 剩余未处理")
+        self.statusBar().showMessage(f"去重已取消 · 已处理 {processed_count} 个文件")
+        self._lbl_dedup_summary.setText(
+            f"⏹ 去重已取消 · 已处理 {processed_count} 个文件, 剩余未处理"
+        )
 
     def _on_dedup_finished(
         self, groups: list, stats: DedupStats
@@ -1379,6 +1402,7 @@ class MainWindow(QMainWindow):
         self._dedup_action_worker.progressed.connect(self._on_dedup_action_progressed)
         self._dedup_action_worker.finished.connect(self._on_dedup_action_finished)
         self._dedup_action_worker.failed.connect(self._on_dedup_action_failed)
+        self._dedup_action_worker.cancelled.connect(self._on_dedup_action_cancelled)  # W8
         self._dedup_action_thread.start()
 
         # UI 状态
@@ -1392,6 +1416,22 @@ class MainWindow(QMainWindow):
     def _on_dedup_action_progressed(self, percent: int, message: str) -> None:
         self._progress.setValue(percent)
         self.statusBar().showMessage(f"动作: {message}")
+
+    def _on_dedup_action_cancelled(self, processed_count: int) -> None:
+        """W8: 取消信号 — 走 CancellationToken 模式, 跟 batch worker 一致.
+
+        部分文件可能已经执行了, 已执行的结果会进 finished.batch
+        (dedup worker 取消时仍然会写 undo log). 只刷 UI 状态,
+        thread 清理交给 _on_dedup_action_finished.
+        """
+        self._log(
+            f"⏹ {self._dedup_action_worker._action if self._dedup_action_worker else '动作'} "
+            f"已取消 · 已处理 {processed_count} 个文件, 剩余未处理"
+        )
+        self.statusBar().showMessage(f"动作已取消 · 已处理 {processed_count} 个文件")
+        self._lbl_dedup_summary.setText(
+            f"⏹ 动作已取消 · 已处理 {processed_count} 个文件, 剩余未处理"
+        )
 
     def _on_dedup_action_finished(self, batch) -> None:
         """DedupActionWorker 完成 → 汇总 + 刷表格 + 提示."""

@@ -706,3 +706,237 @@ class TestRestoreUndoLog:
         assert all(r.success for r in results)
         for o in originals:
             assert o.exists()
+
+
+# ============================================================
+# W8: DedupWorker / DedupActionWorker cancellation
+# ============================================================
+
+
+class _DedupSignalRecorder:
+    """录 DedupWorker / DedupActionWorker 4 个信号.
+
+    finished 信号参数数量不同:
+    - DedupWorker.finished: Signal(list, object) — (groups, stats)
+    - DedupActionWorker.finished: Signal(object) — BatchActionResult
+    用 *args 兼容两种情况.
+    """
+
+    def __init__(self, worker) -> None:
+        self.progressed: list[tuple[int, str]] = []
+        self.finished: list[list] = []
+        self.failed: list[str] = []
+        self.cancelled: list[int] = []
+        worker.progressed.connect(self._on_progressed)
+        worker.finished.connect(self._on_finished)
+        worker.failed.connect(self._on_failed)
+        worker.cancelled.connect(self._on_cancelled)
+
+    def _on_progressed(self, percent, message) -> None:
+        self.progressed.append((percent, message))
+
+    def _on_finished(self, *args) -> None:
+        # DedupWorker: (groups, stats) → 包成 tuple
+        # DedupActionWorker: (batch,) → 直接存
+        if len(args) == 1:
+            self.finished.append(args[0])
+        else:
+            self.finished.append(tuple(args))
+
+    def _on_failed(self, error) -> None:
+        self.failed.append(error)
+
+    def _on_cancelled(self, processed_count) -> None:
+        self.cancelled.append(processed_count)
+
+
+class TestDedupWorkerCancellation:
+    """W8: DedupWorker 走 CancellationToken 模式."""
+
+    def test_cancel_before_run(self, tmp_path: Path) -> None:
+        """预取消, 0 个文件被 hash."""
+        from filemaster.workers.dedup import DedupWorker
+
+        # 造 3 个文件
+        for i in range(3):
+            (tmp_path / f"f{i}.txt").write_text(str(i))
+
+        worker = DedupWorker(source=tmp_path, algorithm="md5", recursive=True)
+        rec = _DedupSignalRecorder(worker)
+        worker.cancel()  # 预取消
+        worker.run()
+
+        # 应该 emit cancelled(0), 不应该 finished
+        assert rec.cancelled == [0]
+        assert rec.finished == []
+        assert rec.failed == []
+
+    def test_cancel_during_run(self, tmp_path: Path, monkeypatch) -> None:
+        """hash 第 2 个文件后取消, processed 至少 1."""
+        import time
+
+        from filemaster.workers import dedup as dedup_mod
+        from filemaster.workers.dedup import DedupWorker
+
+        # 造 5 个文件
+        for i in range(5):
+            (tmp_path / f"f{i}.txt").write_text(str(i))
+
+        # monkey-patch file_hash 减慢, 给 cancel 留时间
+        real_hash = dedup_mod.file_hash
+        call_count = {"n": 0}
+
+        def slow_hash(p, alg):
+            call_count["n"] += 1
+            time.sleep(0.05)  # 50ms 每个文件
+            return real_hash(p, alg)
+
+        monkeypatch.setattr(dedup_mod, "file_hash", slow_hash)
+
+        worker = DedupWorker(source=tmp_path, algorithm="md5", recursive=True)
+        rec = _DedupSignalRecorder(worker)
+
+        # 第 2 个 hash 后调 cancel (在主线程同步执行 run)
+        original_cancel = worker.cancel
+
+        def hook_after_hash(p, alg):
+            if call_count["n"] == 2:
+                original_cancel()
+
+        monkeypatch.setattr(dedup_mod, "file_hash", lambda p, alg: (hook_after_hash(p, alg), slow_hash(p, alg))[1])
+
+        worker.run()
+
+        # 应该 emit cancelled(N), N >= 1
+        assert len(rec.cancelled) == 1
+        assert rec.cancelled[0] >= 1
+        assert rec.finished == []
+        assert rec.failed == []
+
+    def test_cancellation_token_property(self, tmp_path: Path) -> None:
+        """W8: 暴露 cancellation_token 属性."""
+        from filemaster.workers.dedup import DedupWorker
+
+        worker = DedupWorker(source=tmp_path)
+        assert worker.cancellation_token.is_cancelled is False
+        worker.cancel()
+        assert worker.cancellation_token.is_cancelled is True
+
+
+class TestDedupActionWorkerCancellation:
+    """W8: DedupActionWorker 走 CancellationToken 模式."""
+
+    def test_cancel_during_run(self, tmp_path: Path, monkeypatch) -> None:
+        """move 过程中取消, 已处理的文件结果保留."""
+        import time
+
+        from filemaster.workers.dedup import DedupActionWorker, DedupWorker
+
+        # 造 1 个 keeper + 4 个 duplicates (相同内容)
+        keeper = tmp_path / "keeper.txt"
+        keeper.write_text("same")
+        duplicates = []
+        for i in range(4):
+            d = tmp_path / f"dup{i}.txt"
+            d.write_text("same")
+            duplicates.append(d)
+
+        worker = DedupWorker(source=tmp_path, algorithm="md5", recursive=False)
+        rec1 = _DedupSignalRecorder(worker)
+        worker.run()
+        assert len(rec1.finished) == 1
+        # DedupWorker: finished args = (groups, stats) — 用 *args 兼容后是 tuple
+        groups, _stats = rec1.finished[0]
+        assert len(groups) == 1
+        group = groups[0]
+        assert group.count == 5  # 1 keeper + 4 dups
+
+        # 启 DedupActionWorker move, 用 monkey-patch 减慢
+        target = tmp_path / "trash"
+        target.mkdir()
+        action_worker = DedupActionWorker(
+            group=group, action="move", target_dir=target, dry_run=False,
+        )
+        rec2 = _DedupSignalRecorder(action_worker)
+
+        # monkey-patch _run_single 让它慢一点, 在第 2 个文件处理完后取消
+        real_run_single = action_worker._run_single
+        call_count = {"n": 0}
+        original_cancel = action_worker.cancel
+
+        def slow_run_single(src):
+            n = call_count["n"] + 1
+            call_count["n"] = n
+            time.sleep(0.05)
+            result = real_run_single(src)
+            if n == 2:
+                original_cancel()
+            return result
+
+        monkeypatch.setattr(action_worker, "_run_single", slow_run_single)
+
+        action_worker.run()
+
+        # 应该 emit cancelled(N), N >= 1
+        assert len(rec2.cancelled) == 1
+        assert rec2.cancelled[0] >= 1
+        assert rec2.finished == []
+        assert rec2.failed == []
+
+    def test_cancel_before_run(self, tmp_path: Path) -> None:
+        """预取消, 0 个文件处理."""
+        from filemaster.workers.dedup import DedupActionWorker, DedupWorker
+
+        keeper = tmp_path / "keeper.txt"
+        keeper.write_text("same")
+        for i in range(3):
+            (tmp_path / f"dup{i}.txt").write_text("same")
+
+        worker = DedupWorker(source=tmp_path, algorithm="md5", recursive=False)
+        rec1 = _DedupSignalRecorder(worker)
+        worker.run()
+        groups, _stats = rec1.finished[0]
+        group = groups[0]
+
+        target = tmp_path / "trash"
+        target.mkdir()
+        action_worker = DedupActionWorker(
+            group=group, action="move", target_dir=target, dry_run=False,
+        )
+        rec2 = _DedupSignalRecorder(action_worker)
+        action_worker.cancel()
+        action_worker.run()
+
+        assert rec2.cancelled == [0]
+        assert rec2.finished == []
+        assert rec2.failed == []
+
+    def test_cancellation_token_property(self, tmp_path: Path) -> None:
+        """W8: 暴露 cancellation_token 属性."""
+        from filemaster.workers.dedup import DedupActionWorker
+
+        # 最小 group — 用 _make_group helper
+        keeper = tmp_path / "k.txt"
+        d1 = tmp_path / "d1.txt"
+        d2 = tmp_path / "d2.txt"
+        keeper.write_text("a")
+        d1.write_text("a")
+        d2.write_text("a")
+        from filemaster.core.dedup import DuplicateFile, DuplicateGroup
+        group = DuplicateGroup(
+            hash_value="abc",
+            algorithm="md5",
+            files=(keeper, d1, d2),
+            files_with_meta=(
+                DuplicateFile(path=keeper, size=1, mtime=0.0, ctime=0.0),
+                DuplicateFile(path=d1, size=1, mtime=0.0, ctime=0.0),
+                DuplicateFile(path=d2, size=1, mtime=0.0, ctime=0.0),
+            ),
+            hash_size=1,
+            wasted_bytes=2,
+        )
+
+        action_worker = DedupActionWorker(group=group, action="move", dry_run=True)
+        assert action_worker.cancellation_token.is_cancelled is False
+        action_worker.cancel()
+        assert action_worker.cancellation_token.is_cancelled is True

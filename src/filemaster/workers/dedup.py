@@ -10,6 +10,9 @@ W4 v4 范围：
 - 失败信号: failed(error_msg)
 - dry-run 透传
 - 每文件粒度错误隔离（_run_action 内部不 raise, 失败写进 ActionResult）
+
+W8 扩展：用 CancellationToken (W7) 替代 _cancel_requested bool,
+新增 cancelled(int) 信号, 暴露 cancellation_token property.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
+from filemaster.core.cancellation import CancellationToken
 from filemaster.core.dedup import (
     BatchActionResult,
     Deduper,
@@ -41,12 +45,16 @@ class DedupWorker(QObject):
     3. 按 hash 分组找出重复组
     4. 收集 metadata（size/mtime/ctime）
     5. 一次性 finished 信号回主线程
+
+    W8 取消语义：cancel() 后, 下一个文件 hash 前检查 token.is_cancelled,
+    立即退出, 触发 cancelled(processed_count) 信号 (而不是 failed).
     """
 
     # 信号
     progressed = Signal(int, str)  # (percent, message)
     finished = Signal(list, object)  # (list[DuplicateGroup], DedupStats)
     failed = Signal(str)  # error_msg
+    cancelled = Signal(int)  # W8: 已处理的 hash 数 (让 UI 知道扫了多少)
 
     def __init__(
         self,
@@ -59,11 +67,17 @@ class DedupWorker(QObject):
         self._source = source
         self._algorithm = algorithm
         self._recursive = recursive
-        self._cancel_requested = False
+        # W8: 协作式取消令牌, 替代 _cancel_requested bool
+        self._token = CancellationToken()
 
     def cancel(self) -> None:
-        """请求取消（协作式, 下个文件前检查）."""
-        self._cancel_requested = True
+        """请求取消（协作式, 通过 CancellationToken 传给 run 内部检查）."""
+        self._token.cancel()
+
+    @property
+    def cancellation_token(self) -> CancellationToken:
+        """暴露 token 供外部 (测试 / 状态查询) 使用."""
+        return self._token
 
     def _scan_files(self) -> list[Path]:
         """扫描源目录文件."""
@@ -83,16 +97,19 @@ class DedupWorker(QObject):
                 return
             self.progressed.emit(15, f"找到 {len(files)} 个文件, 开始算 hash ...")
 
-            # 算 hash (边算边报进度)
+            # 算 hash (边算边报进度, 边查取消)
             hash_to_files: dict[str, list[Path]] = {}
             total = len(files)
+            processed = 0
             for i, f in enumerate(files, 1):
-                if self._cancel_requested:
-                    self.failed.emit("用户取消")
+                # W8: 协作式取消 — 在文件之间检查, 不打断单文件 IO
+                if self._token.is_cancelled:
+                    self.cancelled.emit(processed)
                     return
                 try:
                     h = file_hash(f, self._algorithm)
                     hash_to_files.setdefault(h, []).append(f)
+                    processed += 1
                 except OSError as e:
                     # 单个文件失败不阻塞整体
                     self.progressed.emit(
@@ -168,11 +185,15 @@ class DedupActionWorker(QObject):
 
     跟 DedupWorker 同样模式：QObject + QThread + 协作式取消。
     接受一个 DuplicateGroup, 跑一个动作, 出 BatchActionResult.
+
+    W8 取消语义：cancel() 后, 下一个文件前检查 token.is_cancelled,
+    已处理的文件结果保留, 触发 cancelled(processed_count) 信号.
     """
 
     progressed = Signal(int, str)          # (percent, message)
     finished = Signal(object)              # (BatchActionResult)
     failed = Signal(str)                   # error_msg
+    cancelled = Signal(int)                # W8: 已处理的文件数
 
     def __init__(
         self,
@@ -191,10 +212,17 @@ class DedupActionWorker(QObject):
         self._dry_run = dry_run
         self._overwrite = overwrite
         self._use_trash = use_trash
-        self._cancel_requested = False
+        # W8: 协作式取消令牌
+        self._token = CancellationToken()
 
     def cancel(self) -> None:
-        self._cancel_requested = True
+        """请求取消（W8: 通过 CancellationToken）."""
+        self._token.cancel()
+
+    @property
+    def cancellation_token(self) -> CancellationToken:
+        """暴露 token 供外部状态查询."""
+        return self._token
 
     def run(self) -> None:
         try:
@@ -210,8 +238,9 @@ class DedupActionWorker(QObject):
             undo_entries: list[dict] = []
 
             for i, src in enumerate(self._group.duplicates, 1):
-                if self._cancel_requested:
-                    self.failed.emit(f"用户取消 (已处理 {i - 1}/{total})")
+                # W8: 协作式取消 — 在文件之间检查
+                if self._token.is_cancelled:
+                    self.cancelled.emit(i - 1)  # i-1 = 已完成文件数
                     return
 
                 # 单文件动作 - 包 try/except 防止 OSError 击穿

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "filemaster"
-version = "0.7.0"
+version = "0.8.0"
 description = "FileMaster — 文件批量处理工具（重命名 / 分类 / 转换 / 去重 / 归档）"
 readme = "README.md"
 license = {file = "LICENSE"}
