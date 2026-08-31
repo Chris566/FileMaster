@@ -188,7 +188,7 @@ class Renamer:
         # W3: 文档元数据（lazy import — PyMuPDF/Pillow 启动慢）
         metadata_keys = {"Title", "Author", "Subject", "PageCount", "ImageWidth", "ImageHeight"}
         if used & metadata_keys:
-            from filemaster.core.metadata import MetadataReader  # noqa: PLC0415
+            from filemaster.core.metadata import MetadataReader
             try:
                 meta = MetadataReader().read(file)
                 if "Title" in used:
