@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-31
+
+### Added (W5) — 重命名引擎收尾
+
+- **`core/metadata.py`** — 5 类文件全部 metadata 字段提取
+  - 新字段：`paragraphs`（Word 段落数）/ `sheets_count`（Excel 表数）/ `taken_at`（EXIF 拍摄时间）/ `camera_make` / `camera_model` / `image_format` / `width` / `height` / `aspect_ratio`
+  - 新 helper：`_compute_aspect_ratio(width, height)` — 匹配 16:9 / 4:3 / 1:1 / 3:2 / 21:9 / 5:4 / 2:3 / 9:16（2% 容差）
+  - EXIF 提取从 PNG 转向 JPEG 容器（PNG 不存 EXIF）
+- **`core/renamer.py`** — 4 套**命名空间占位符**（lazy load：未用到的 namespace 不读文件）
+  - `{pdf_title}` / `{pdf_author}` / `{pdf_subject}` / `{pdf_pages}` / `{pdf_created}` / `{pdf_modified}`
+  - `{word_title}` / `{word_author}` / `{word_subject}` / `{word_paragraphs}` / `{word_created}` / `{word_modified}`
+  - `{excel_title}` / `{excel_author}` / `{excel_subject}` / `{excel_sheets}` / `{excel_sheet_name}` / `{excel_created}` / `{excel_modified}`
+  - `{image_width}` / `{image_height}` / `{image_taken_at}` / `{image_camera_make}` / `{image_camera_model}` / `{image_format}` / `{image_aspect_ratio}`
+- **`core/renamer.py`** — `apply_with_progress(on_progress)` 逐文件回调（CLI/GUI 进度条统一接口）
+  - 进度回调异常内部 `contextlib.suppress` 吞掉，不影响主流程
+- **`cli.py` — `rename` 子命令真实集成**（之前是 W5 占位）
+  - 参数：`-s`（单文件/目录）/ `-t`（模板）/ `-p`（前缀）/ `--start-index` / `--conflict {skip,overwrite,rename_new}` / `--dry-run` / `--json` / `-r`（递归）
+  - `threading.Thread` 包装 + ASCII 进度条 `[████░░░] 50.0% (1/2)`
+  - JSON 模式不打 header，`json.loads(stdout)` 直接解析
+- **Tests** — 16 个新单测（10 renamer namespace + 4 apply_with_progress + 15 CLI rename，含 3 collision + 1 JSON output + 2 namespace placeholder）
+- **累计**: 375 单测通过 / 0 失败 / 5 跳过 / ruff clean
+
 ## [0.2.0] - 2026-08-31
 
 ### Added (W4) — Dedup 完整闭环

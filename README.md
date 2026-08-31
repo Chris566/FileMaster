@@ -19,7 +19,7 @@ cd FileMaster
 # 2. 安装
 pip install -e ".[dev]"
 
-# 3. 跑测试（329+ 用例）
+# 3. 跑测试（375+ 用例）
 pytest tests/unit/ --cov=src/filemaster
 
 # 4. 启动 GUI
@@ -38,9 +38,45 @@ pyinstaller build/filemaster.spec --clean --noconfirm
 
 ## 核心功能
 
-### 重命名（W1-W2）
+### 重命名（W1-W2 + W5）— 引擎收尾
 
-- **占位符引擎** — `{Prefix} {OriginalName} {BaseName} {Extension} {Index:D3} {Date} {Title} {Author}`
+**占位符引擎**（W1-W2 通用 + W5 命名空间）：
+- **通用**：`{Prefix}` / `{OriginalName}` / `{BaseName}` / `{Extension}` / `{Index:D3}` / `{Date}` / `{Title}` / `{Author}`
+- **W5 命名空间**（按文件类型 lazy load，未用到不读文件）：
+  - **PDF**：`{pdf_title}` `{pdf_author}` `{pdf_subject}` `{pdf_pages}` `{pdf_created}` `{pdf_modified}`
+  - **Word**：`{word_title}` `{word_author}` `{word_subject}` `{word_paragraphs}` `{word_created}` `{word_modified}`
+  - **Excel**：`{excel_title}` `{excel_author}` `{excel_subject}` `{excel_sheets}` `{excel_sheet_name}` `{excel_created}` `{excel_modified}`
+  - **Image**：`{image_width}` `{image_height}` `{image_taken_at}` `{image_camera_make}` `{image_camera_model}` `{image_format}` `{image_aspect_ratio}`（16:9 / 4:3 / 1:1 / 3:2 / 21:9 / 5:4 / 2:3 / 9:16，2% 容差）
+
+**CLI 实战**（W5 完整集成）：
+
+```bash
+# 基础：按模板重命名（带 ASCII 进度条 + 3 种冲突策略）
+python -m filemaster.cli rename -s <dir> -t "{Index:D3}_{OriginalName}" -p "img_"
+
+# 跳过/覆盖/重命名 冲突策略
+python -m filemaster.cli rename -s <dir> -t "{Index:D3}_{OriginalName}" --conflict skip
+python -m filemaster.cli rename -s <dir> -t "{Index:D3}_{OriginalName}" --conflict overwrite
+python -m filemaster.cli rename -s <dir> -t "{Index:D3}_{OriginalName}" --conflict rename_new
+
+# 单文件精确定位（避开 dir scan）
+python -m filemaster.cli rename -s <file> -t "{pdf_title}_{OriginalName}"
+
+# 命名空间占位符 (按文件类型提取 metadata)
+python -m filemaster.cli rename -s <dir> -t "{pdf_title}_{pdf_pages}p_{OriginalName}"
+python -m filemaster.cli rename -s <dir> -t "{image_aspect_ratio}_{OriginalName}"  # 例: 16_9_img.png
+
+# Dry-run (只规划不执行) + JSON 输出 (供脚本消费)
+python -m filemaster.cli rename -s <dir> -t "{Index:D3}_{OriginalName}" --dry-run --json
+```
+
+**W5 引擎细节**：
+- `apply_with_progress(on_progress)` — 逐文件回调，进度条统一接口
+- 冲突策略：`skip`（目标存在则跳过）/ `overwrite`（覆盖，旧值进 undo 栈）/ `rename_new`（自动加 `(1)` `(2)` ...）
+- 跨平台 atomic overwrite（`os.replace`，Windows 目标存在不抛 FileExistsError）
+- 进度回调异常内部 `contextlib.suppress` 吞掉，不影响主流程
+
+**其他**：
 - **分类器** — 内置 5 类（PDF / WORD / EXCEL / PPT / IMAGE）+ 自定义扩展
 - **元数据** — PDF (PyMuPDF) / Word (python-docx) / Excel (openpyxl) / Image (EXIF)
 - **预览** — 前 N 文件元数据快照
@@ -101,13 +137,14 @@ python -m filemaster.cli dedup-undo restore --log <log-file>       # 恢复 move
 | **W2** | 重命名引擎 + 6 占位符 + 异步 UI | ✅ 完成 | 异步扫描 + 进度回调 |
 | **W3** | 元数据提取（PDF/Word/Excel/Image） | ✅ 完成（+21 test） | 6 个 placeholder 接入 metadata |
 | **W4** | Dedup 完整闭环（扫描/动作/Undo 恢复+GUI） | ✅ 完成（329 测试） | MD5/SHA1/SHA256/BLAKE2b · 4 动作策略 · GUI 集成 |
-| W5-W6 | 异步任务 + 进度条 | 🔜 | |
+| **W5** | 重命名收尾 + 4 套 namespace placeholder + CLI 真集成 | ✅ 完成（375 测试） | PDF/Word/Excel/Image 命名空间 · apply_with_progress · 单文件源 |
+| W6 | 异步任务 + 进度条（dedup worker 已前置） | 🔜 | |
 | W7-W10 | （Dedup UI 阶段，W4 已超量完成） | ✅ W4 提前覆盖 | — |
 | W11-W13 | 飞书集成 + 右键菜单注册 | 🔜 | |
 | W14-W15 | 打包优化 + 自动更新 | 🔜 | |
 | W16 | v1.0 发布 | 🔜 | |
 
-**当前累计**：329 单测通过 / 0 失败 / 5 跳过 · 跨平台 3 OS × 3 Python CI 全绿 · Windows 全链路冒烟通过。
+**当前累计**：375 单测通过 / 0 失败 / 5 跳过 · 跨平台 3 OS × 3 Python CI 全绿 · Windows 全链路冒烟通过。
 
 ## 16 周路线图
 
