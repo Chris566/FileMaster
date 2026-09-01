@@ -182,6 +182,58 @@ renamer.apply_with_progress(
 
 **累计**：405 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
 
+### 硬中断 safe_rename（W9）— 取消按钮秒级响应
+
+W7+W8 的协作式取消解决了"文件之间能停"的问题，但单文件 `os.replace` 本身是原子的、不可中断。处理大文件时（GB 级视频/镜像），用户点取消后还要等几秒，体感差。W9 引入 **safe_rename**：把单文件操作拆成可中断的两步，源文件始终在可控状态。
+
+**两阶段 rename**：
+- **Step A**：`shutil.move(src, src+".filemaster.tmp.<8hex>")` — 同卷是 rename (瞬时)，跨卷是 copy+delete
+- **中断检查点**：调用 `is_cancelled()` — 返回 True 时 `shutil.move(tmp, src)` 回滚
+- **Step B**：`os.replace(tmp, dst)` — 原子覆盖（不可中断，但同卷极快微秒级）
+
+**核心 API**（`core/safe_rename.py`）：
+
+```python
+from filemaster.core.safe_rename import safe_rename, SafeRenameResult
+
+result: SafeRenameResult = safe_rename(
+    src, dst,
+    is_cancelled=lambda: token.is_cancelled,  # 可选
+)
+# result.status: "OK" | "ROLLBACK" | "ERROR"
+# result.source / result.target / result.message
+```
+
+**状态语义**：
+- `OK` — 成功，dst 已是新文件（可入 UndoStack）
+- `ROLLBACK` — 取消，src 仍在原位（**不入 UndoStack**——没真完成 rename）
+- `ERROR` — 失败，src 可能已动，残留 .tmp 需 cleanup_orphan_tmps
+
+**临时文件命名**：`.filemaster.tmp.<8hex>` — 8 字符 md5(ino + mtime_ns + size)，避免长名撞 Windows MAX_PATH 260
+
+**集成点**：
+- `_apply_one` 改用 `safe_rename` 替代直接 `os.replace`
+- `apply` 入口调用 `_cleanup_tmps(files)` 清理残留（应对崩溃/杀进程场景）
+- `file_hash` 加 `is_cancelled` 参数，每块读取后检查（GB 文件可中断）— 抛 `HashCancelledError(InterruptedError)`
+
+**W7+W8+W9 三层取消契约**：
+- W7：文件循环顶部检查（文件之间）
+- W8：所有 worker 统一暴露 `cancellation_token` property
+- W9：单文件 `safe_rename` Step A 后内部检查（**单文件之内**）
+
+**孤儿清理**（`find_orphan_tmps` / `cleanup_orphan_tmps`）：
+- 递归扫描子目录
+- worker 启动 + apply 入口各调一次
+- 处理崩溃/kill -9 场景的残留
+
+**Tests** — 18 个新单测：
+- `test_safe_rename.py` — 18 个：make_tmp_path (4) / safe_rename normal (4) / cancel rollback (3) / errors (2) / orphan tmps (5)
+- `test_renamer.py` — 6 个：apply_with_progress rollback (4) / apply entry cleanup (2)
+- `test_batch.py` — 2 个：hard cancel keeps source (1) / normal no orphan (1)
+- `test_hash.py` — 3 个：is_cancelled 行为（None / always False / immediate raise）
+
+**累计**：431 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
+
 **其他**：
 - **分类器** — 内置 5 类（PDF / WORD / EXCEL / PPT / IMAGE）+ 自定义扩展
 - **元数据** — PDF (PyMuPDF) / Word (python-docx) / Excel (openpyxl) / Image (EXIF)
@@ -247,7 +299,8 @@ python -m filemaster.cli dedup-undo restore --log <log-file>       # 恢复 move
 | **W6** | BatchWorker 重构 + GUI 进度条升级 + ETA 估算 | ✅ 完成（381 测试） | apply_with_progress 集成 · ETA 滑动窗口 · ✅⚠️⏭❌ 状态图标 · 同步到可见日志面板 |
 | **W7** | apply_with_progress 协作式取消 (CancellationToken) | ✅ 完成（389 测试） | core/cancellation.py · 取消即生效 · cancelled(n) 信号 · undo 只入已处理 |
 | **W8** | CancellationToken 推广到 Dedup / Preview Worker | ✅ 完成（405 测试） | 全 worker 统一取消契约 · 7 个新单测（dedup × 6 + preview × 2 − 1 共享 helper）· monkey-patch 减速模式 |
-| W7-W10 | （Dedup UI 阶段，W4 已超量完成） | ✅ W4 提前覆盖 | — |
+| **W9** | 硬中断 safe_rename (单文件两步可中断) | ✅ 完成（431 测试） | 拆分 os.replace 为 Step A + 检查 + Step B · 源文件始终可控 · .filemaster.tmp.<8hex> 临时文件 · 29 个新单测（safe_rename 18 + renamer 6 + batch 2 + hash 3）|
+| W7-W10 | Dedup UI 阶段，W4 已超量完成 | ✅ W4 + W9 (硬中断) | W9 完成 hard interrupt safe_rename; W10 保留为后续可拓展 |
 | W11-W13 | 飞书集成 + 右键菜单注册 | 🔜 | |
 | W14-W15 | 打包优化 + 自动更新 | 🔜 | |
 | W16 | v1.0 发布 | 🔜 | |

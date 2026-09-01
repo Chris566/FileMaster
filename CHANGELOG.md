@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-01
+
+### Added (W9) — 硬中断 safe_rename
+
+把单文件 `os.replace` 操作拆成可中断的两步，源文件始终在可控状态。W7+W8 解决了"文件之间能停"，W9 进一步解决"大文件 GB 级也能秒级响应取消"。
+
+**核心变更**：
+- `core/safe_rename.py` 新模块：`safe_rename(src, dst, is_cancelled) -> SafeRenameResult` · `make_tmp_path` · `find_orphan_tmps` · `cleanup_orphan_tmps`
+- `core/renamer.py` — `_apply_one` 改用 `safe_rename` 替代直接 `os.replace`；`apply` 入口调 `_cleanup_tmps` 清理残留
+- `utils/hash.py` — `file_hash` 加 `is_cancelled` 参数；新增 `HashCancelledError(InterruptedError)`
+
+**两阶段 rename 流程**：
+1. Step A: `shutil.move(src, src+".filemaster.tmp.<8hex>")`
+2. 中断检查点: 调 `is_cancelled()` — True 时回滚
+3. Step B: `os.replace(tmp, dst)` 原子覆盖
+
+**状态语义**：
+- `OK` — 成功，可入 UndoStack
+- `ROLLBACK` — 取消，src 保留，**不入 UndoStack**（没真完成）
+- `ERROR` — 失败，残留 .tmp 需 `cleanup_orphan_tmps`
+
+**W7+W8+W9 三层取消契约**：
+- W7：文件循环顶部（文件之间）
+- W8：所有 worker 暴露 `cancellation_token` property
+- W9：单文件 `safe_rename` Step A 后（**单文件之内**）
+
+**Tests** — 29 个新单测：
+- `test_safe_rename.py` — 18 个（make_tmp_path 4 / safe_rename normal 4 / cancel rollback 3 / errors 2 / orphan tmps 5）
+- `test_renamer.py` — 6 个（apply_with_progress rollback 4 / apply entry cleanup 2）
+- `test_batch.py` — 2 个（hard cancel keeps source 1 / normal no orphan 1）
+- `test_hash.py` — 3 个（is_cancelled None / always False / immediate raise）
+
+**累计**：431 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
+
 ## [0.8.0] - 2026-08-31
 
 ### Added (W8) — CancellationToken 扩展到 Dedup / Preview Worker
