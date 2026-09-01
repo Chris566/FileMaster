@@ -918,3 +918,175 @@ class TestDedupUndoDialog:
         assert src.read_text() == "hello"
         assert not moved.exists()
         dlg.close()
+
+
+# ============================================================
+# W10 follow-up: 主工具栏 ↶ 撤销按钮接 UndoStack.restore_latest dispatcher
+# ============================================================
+
+
+class TestMainUndoButton:
+    """验证主工具栏 ↶ 撤销按钮走 dispatcher 闭环.
+
+    覆盖:
+      - 默认栈空时按钮 disable
+      - push UndoEntry 后按钮 enable
+      - 点击 Archive entry → 删归档文件 + 按钮回到 disable
+      - 点击 Classify entry → 移回 source
+      - 点击 Delete entry → 拒绝 (success=False)
+      - 空栈点击 → 日志 "撤销栈为空"
+      - 状态栏显示汇总
+    """
+
+    def test_undo_button_disabled_when_stack_empty(self, main_window) -> None:
+        """默认空栈时 ↶ 撤销按钮 disable."""
+        assert main_window._btn_undo is not None
+        assert main_window._btn_undo.text() == "↶ 撤销"
+        assert not main_window._btn_undo.isEnabled()
+
+    def test_undo_button_enabled_after_push(self, main_window) -> None:
+        """push UndoEntry 后按钮 enable."""
+        from filemaster.core.undo import UndoEntry
+
+        main_window._undo_stack.push([
+            UndoEntry(operation="RenameOnly", source=Path("/tmp/a"), target=Path("/tmp/b"))
+        ])
+        main_window._refresh_undo_button_state()
+        assert main_window._btn_undo.isEnabled()
+        assert "1 步可撤销" in main_window._btn_undo.toolTip()
+
+    def test_undo_archive_deletes_target(self, main_window, tmp_path: Path) -> None:
+        """Archive entry: 撤销时 dispatcher 删 target 归档文件."""
+        from filemaster.core.undo import UndoEntry
+
+        archive = tmp_path / "batch.zip"
+        archive.write_bytes(b"PK\x03\x04fake")
+        source = tmp_path / "src.txt"
+        source.write_text("hello")
+
+        main_window._undo_stack.push([
+            UndoEntry(operation="Archive", source=source, target=archive)
+        ])
+        main_window._refresh_undo_button_state()
+        assert archive.exists()
+
+        main_window._on_undo()
+
+        # 归档被删, 源文件保留
+        assert not archive.exists()
+        assert source.exists()
+        # 栈空, 按钮回到 disable
+        assert not main_window._btn_undo.isEnabled()
+        # 日志记录成功
+        log_text = main_window._txt_log.toPlainText()
+        assert "撤销完成" in log_text
+        assert "成功 1" in log_text
+
+    def test_undo_classify_moves_target_back(self, main_window, tmp_path: Path) -> None:
+        """Classify entry: 撤销时 dispatcher 移回 source."""
+        from filemaster.core.undo import UndoEntry
+
+        src = tmp_path / "doc.pdf"
+        classified = tmp_path / "PDF" / "doc.pdf"
+        classified.parent.mkdir()
+        classified.write_bytes(b"%PDF-1.4")
+
+        main_window._undo_stack.push([
+            UndoEntry(operation="Classify", source=src, target=classified)
+        ])
+        main_window._refresh_undo_button_state()
+
+        main_window._on_undo()
+
+        # 移回原位置
+        assert src.exists()
+        assert src.read_bytes() == b"%PDF-1.4"
+        assert not classified.exists()
+
+    def test_undo_delete_is_rejected(self, main_window) -> None:
+        """Delete entry: dispatcher 拒绝 (不可恢复)."""
+        from filemaster.core.undo import UndoEntry
+
+        main_window._undo_stack.push([
+            UndoEntry(operation="Delete", source=Path("/tmp/deleted.txt"))
+        ])
+        main_window._refresh_undo_button_state()
+
+        main_window._on_undo()
+
+        # Delete 拒绝, 栈被 pop 掉 (restore_latest 弹出来后不还原)
+        assert len(main_window._undo_stack) == 0
+        log_text = main_window._txt_log.toPlainText()
+        assert "失败" in log_text
+        assert "不可恢复" in log_text or "Delete" in log_text
+
+    def test_undo_empty_stack_shows_info_log(self, main_window) -> None:
+        """空栈点击: 不抛异常 + 日志写 '撤销栈为空'."""
+        main_window._on_undo()
+        log_text = main_window._txt_log.toPlainText()
+        assert "撤销栈为空" in log_text
+        # status bar 提示
+        assert main_window.statusBar().currentMessage() == "撤销栈为空"
+
+    def test_undo_statusbar_summary(self, main_window, tmp_path: Path) -> None:
+        """撤销成功后状态栏显示汇总."""
+        from filemaster.core.undo import UndoEntry
+
+        archive = tmp_path / "out.tar.gz"
+        archive.write_bytes(b"fake")
+
+        main_window._undo_stack.push([
+            UndoEntry(operation="Archive", source=tmp_path / "src", target=archive)
+        ])
+        main_window._refresh_undo_button_state()
+
+        main_window._on_undo()
+
+        msg = main_window.statusBar().currentMessage()
+        assert "撤销完成" in msg
+        assert "成功 1" in msg
+
+    def test_refresh_undo_button_state_toggles_tooltip(self, main_window) -> None:
+        """_refresh_undo_button_state 同时改 enable + tooltip."""
+        from filemaster.core.undo import UndoEntry
+
+        # 空栈
+        main_window._refresh_undo_button_state()
+        assert not main_window._btn_undo.isEnabled()
+        assert "撤销栈为空" in main_window._btn_undo.toolTip()
+
+        # 1 步
+        main_window._undo_stack.push([
+            UndoEntry(operation="RenameOnly", source=Path("/tmp/a"), target=Path("/tmp/b"))
+        ])
+        main_window._refresh_undo_button_state()
+        assert main_window._btn_undo.isEnabled()
+        assert "1 步可撤销" in main_window._btn_undo.toolTip()
+
+        # 2 步
+        main_window._undo_stack.push([
+            UndoEntry(operation="RenameOnly", source=Path("/tmp/c"), target=Path("/tmp/d"))
+        ])
+        main_window._refresh_undo_button_state()
+        assert "2 步可撤销" in main_window._btn_undo.toolTip()
+
+    def test_undo_skip_result_shows_warning(self, main_window, tmp_path: Path) -> None:
+        """Classify 冲突时 (overwrite=False) dispatcher 返 skipped, UI 写 ⚠️ 警告."""
+        from filemaster.core.undo import UndoEntry
+
+        src = tmp_path / "doc.pdf"
+        src.write_bytes(b"original")  # 源位置已有文件
+        classified = tmp_path / "PDF" / "doc.pdf"
+        classified.parent.mkdir()
+        classified.write_bytes(b"classified")
+
+        main_window._undo_stack.push([
+            UndoEntry(operation="Classify", source=src, target=classified)
+        ])
+        main_window._refresh_undo_button_state()
+
+        main_window._on_undo()
+
+        log_text = main_window._txt_log.toPlainText()
+        assert "跳过" in log_text
+        assert "⚠️" in log_text
