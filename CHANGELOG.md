@@ -193,6 +193,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 **累计**：508 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
 
+### Added (W10 follow-up UI)
+
+- **主工具栏 ↶ 撤销按钮接 dispatcher 闭环**（`ui/main_window.py`）
+  - `_on_undo()` 重写：调 `self._undo_stack.restore_latest()` 一步 pop + dispatcher 还原，遍历 `RestoreEntryResult[]` 按 success/skipped/failure 分类写入日志（✅/⚠️/❌）+ 状态栏汇总
+  - 新增 `_refresh_undo_button_state()`：根据 `len(self._undo_stack)` 刷新 `_btn_undo` enable + tooltip（栈深提示「N 步可撤销」）
+  - 3 处接入点刷新按钮状态：初始化 / `BatchWorker._on_finished` / `DedupActionWorker._on_dedup_action_finished`
+  - `Ctrl+Z` 快捷键 + 菜单项「编辑 → 撤销」继续生效（无需改）
+  - 空栈时按钮自动 disable，避免误点
+
+### Tests (W10 follow-up UI)
+
+- `tests/unit/test_main_window.py::TestMainUndoButton` — 9 个新单测：
+  - 默认空栈时 `_btn_undo` disable
+  - push UndoEntry 后 enable + tooltip 含「N 步可撤销」
+  - Archive entry 撤销 → 删归档 + 源保留 + 按钮回 disable
+  - Classify entry 撤销 → 移回 source
+  - Delete entry 撤销 → 拒绝（success=False + 日志「不可恢复」）
+  - 空栈点击 → 日志「撤销栈为空」+ statusBar 提示
+  - 状态栏汇总消息格式
+  - `_refresh_undo_button_state` tooltip 联动（空 / 1 步 / 2 步）
+  - Classify 冲突时 dispatcher 返 skipped → UI 写 ⚠️ 警告
+
+**累计**：517 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
+
 ## [0.1.0] - 2026-08-30
 
 ### Added (W1)

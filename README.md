@@ -323,6 +323,18 @@ filemaster archive -s ./data -o ./backups -n x --json
 
 **累计**：486 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
 
+
+### 撤销按钮接 dispatcher（W10 follow-up UI）— 主工具栏 ↶ 走 restore_latest
+
+主工具栏的 ↶ 撤销按钮（同时绑定 `Ctrl+Z` 快捷键 + 编辑菜单）从 W5 的「手写 pop + 手动 shutil.copy2 / rename」升级为**直接调 `UndoStack.restore_latest()` dispatcher**：
+
+- 按下撤销 → 一步 `pop()` + dispatcher 还原全部 entry → 遍历 `RestoreEntryResult[]` 按 success / skipped / failure 分类写日志（✅/⚠️/❌）+ 状态栏汇总
+- 按钮 enable 状态跟 `len(self._undo_stack)` 联动：栈空自动 disable + tooltip 提示「撤销栈为空」；有 step 时 enable + tooltip「N 步可撤销」
+- 3 处自动刷新点：UI 初始化 / `BatchWorker._on_finished` / `DedupActionWorker._on_dedup_action_finished`
+- 覆盖全 8 种 `OperationType`（Archive / CopyOnly / Classify / Delete / Rename* / 未知）+ overwrite 冲突 + dry-run 三态
+
+新增 9 个 UI 单测（`test_main_window.py::TestMainUndoButton`）：空栈 / push 后 enable / Archive 删 target / Classify 移回 / Delete 拒绝 / 空栈日志 / 状态栏汇总 / tooltip 联动 / skipped 警告。
+
 ### 去重 Dedup（W3-W4）— 完整闭环
 
 
@@ -385,7 +397,7 @@ python -m filemaster.cli dedup-undo restore --log <log-file>       # 恢复 move
 | **W7** | apply_with_progress 协作式取消 (CancellationToken) | ✅ 完成（389 测试） | core/cancellation.py · 取消即生效 · cancelled(n) 信号 · undo 只入已处理 |
 | **W8** | CancellationToken 推广到 Dedup / Preview Worker | ✅ 完成（405 测试） | 全 worker 统一取消契约 · 7 个新单测（dedup × 6 + preview × 2 − 1 共享 helper）· monkey-patch 减速模式 |
 | **W9** | 硬中断 safe_rename (单文件两步可中断) | ✅ 完成（431 测试） | 拆分 os.replace 为 Step A + 检查 + Step B · 源文件始终可控 · .filemaster.tmp.<8hex> 临时文件 · 29 个新单测（safe_rename 18 + renamer 6 + batch 2 + hash 3）|
-| **W10** | 归档 archive (zip / tar.gz / tar.bz2) | ✅ 完成（508 测试） | 3 种格式 · 进度 + 取消 + 原子写入 · UndoStack 集成 · CLI 子命令 · **撤销 dispatcher** (restore_latest) · 73 个新单测 (51 + 22) |
+| **W10** | 归档 archive (zip / tar.gz / tar.bz2) | ✅ 完成（517 测试） | 3 种格式 · 进度 + 取消 + 原子写入 · UndoStack 集成 · CLI 子命令 · **撤销 dispatcher** (restore_latest) · **UI 接入**（主工具栏 ↶ 按钮 + Ctrl+Z 走 dispatcher + 栈深联动 enable） · 82 个新单测 (51 + 22 + 9) |
 | W11-W13 | 飞书集成 + 右键菜单注册 | 🔜 | |
 | W14-W15 | 打包优化 + 自动更新 | 🔜 | |
 | W16 | v1.0 发布 | 🔜 | |
