@@ -26,6 +26,7 @@ OperationType = Literal[
     "RenameAndOverwrite",
     "Classify",
     "Delete",
+    "Archive",  # W10: 创建归档 (撤销 = 删除 archive_path)
 ]
 
 

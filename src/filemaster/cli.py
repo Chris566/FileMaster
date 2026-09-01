@@ -397,6 +397,141 @@ def _cmd_rename(args: argparse.Namespace) -> int:
 
 
 # ============================================================
+# W10: archive — 压缩归档 (zip / tar.gz / tar.bz2)
+# ============================================================
+
+
+_ARCHIVE_STATUS_ZH = {"OK": "完成", "CANCELLED": "取消", "ERROR": "错误"}
+
+
+"""W10: archive — 压缩归档 (zip / tar.gz / tar.bz2)
+
+两种模式:
+  1) 单卷: -s <dir|file> -o <out_dir> -n <name>.[zip|tar.gz|tar.bz2]
+  2) 按类分卷: -s <dir> --by-category (生成 IMAGE.zip / DOCUMENT.zip / ...)
+走 Archiver.archive_with_progress (W7 协作式 + W9 硬中断).
+"""
+
+
+def _cmd_archive(args: argparse.Namespace) -> int:
+    from filemaster.core.archiver import ArchiveFormat, Archiver
+
+    source = Path(args.source).resolve()
+    output_dir = Path(args.output).resolve()
+    fmt = ArchiveFormat(args.format)
+
+    if not source.exists():
+        print(f"❌ 源路径不存在: {source}", file=sys.stderr)
+        return 1
+
+    # 1) 收集文件
+    if source.is_file():
+        files = [source]
+    elif args.recursive:
+        files = sorted(p for p in source.rglob("*") if p.is_file())
+    else:
+        files = sorted(p for p in source.iterdir() if p.is_file())
+    if not files:
+        print(f"⚠️  源无文件: {source}")
+        return 0
+
+    # 2) 试运行
+    if args.dry_run:
+        if args.json:
+            print(json.dumps({
+                "mode": "by_category" if args.by_category else "single",
+                "format": fmt.value,
+                "compression": args.compression,
+                "source": str(source),
+                "output": str(output_dir),
+                "files": [str(f) for f in files],
+                "count": len(files),
+            }, ensure_ascii=False, indent=2))
+        else:
+            mode = "按类分卷" if args.by_category else "单卷"
+            print(f"🔍 DRY-RUN  archive {mode} 格式={fmt.value} 压缩={args.compression}")
+            print(f"   源: {source}")
+            print(f"   输出: {output_dir}")
+            print(f"   文件数: {len(files)}")
+        return 0
+
+    # 3) 进度回调 + 异步
+    progress_done = {"count": 0, "last_msg": ""}
+
+    def on_progress(i: int, total: int, file: Path, written: int) -> None:
+        progress_done["count"] = i
+        if args.json:
+            return
+        pct = i / total * 100
+        bar = _make_progress_bar(pct)
+        line = f"  {bar} {pct:5.1f}% ({i}/{total})  {file.name}   "
+        if len(line) > 120:
+            line = line[:117] + "..."
+        print(f"\r{line}", end="", flush=True)
+        if i == total:
+            print()
+
+    result_holder: dict = {"results": None, "exc": None}
+
+    def _worker() -> None:
+        try:
+            archiver = Archiver()
+            if args.by_category:
+                cat_results = archiver.archive_by_category(
+                    files, output_dir, fmt=fmt, compression=args.compression,
+                    on_progress=on_progress,
+                )
+                result_holder["results"] = list(cat_results.values())
+            else:
+                archive_path = output_dir / f"{args.name}{fmt.extension}"
+                result_holder["results"] = [archiver.archive_with_progress(
+                    files, archive_path, fmt=fmt, compression=args.compression,
+                    on_progress=on_progress,
+                )]
+        except Exception as e:
+            result_holder["exc"] = e
+
+    # W5 模式: 简单 threading 包装 (UI / 实时刷新进度)
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join()
+
+    if result_holder["exc"] is not None:
+        print(f"❌ 归档失败: {result_holder['exc']}", file=sys.stderr)
+        return 1
+    results = result_holder["results"] or []
+
+    # 4) 汇总
+    if args.json:
+        out = [{
+            "archive_path": str(r.archive_path),
+            "source_count": r.source_count,
+            "written_bytes": r.written_bytes,
+            "elapsed": round(r.elapsed, 3),
+            "status": r.status,
+            "message": r.message,
+        } for r in results]
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+    else:
+        print(f"\n✅ 归档完成 — {len(results)} 卷")
+        for r in results:
+            label = _ARCHIVE_STATUS_ZH.get(r.status, r.status)
+            print(
+                f"  [{label}] {r.archive_path.name}  "
+                f"{r.source_count} 文件 / {r.written_bytes:,} B / {r.elapsed:.2f}s"
+            )
+
+    return 0 if all(r.status == "OK" for r in results) else 1
+
+
+_ARCHIVE_STATUS_ZH = {
+    "OK": "完成",
+    "CANCELLED": "取消",
+    "ERROR": "错误",
+}
+
+
+# ============================================================
 # W4 v4: dedup-scan + dedup-move/delete/hardlink
 # ============================================================
 
@@ -667,6 +802,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="输出 JSON (便于脚本管道)"
     )
     p_rename.set_defaults(func=_cmd_rename)
+
+    # ----- archive (W10) -----
+    p_archive = sub.add_parser(
+        "archive", help="压缩归档 (W10: zip / tar.gz / tar.bz2)"
+    )
+    p_archive.add_argument(
+        "-s", "--source", required=True, help="源目录 (--by-category 模式) 或单文件"
+    )
+    p_archive.add_argument(
+        "-o", "--output", required=True, help="归档输出目录"
+    )
+    p_archive.add_argument(
+        "-n", "--name", default="archive",
+        help="归档名 (单卷模式, 默认 archive, 扩展名按 --format 自动加)",
+    )
+    p_archive.add_argument(
+        "--format", default="zip", choices=["zip", "tar.gz", "tar.bz2"],
+        help="归档格式 (默认 zip)",
+    )
+    p_archive.add_argument(
+        "--compression", type=int, default=6, choices=range(0, 10),
+        help="压缩级别 0-9 (默认 6, 0 = 不压缩, 9 = 最大)",
+    )
+    p_archive.add_argument(
+        "--by-category", action="store_true",
+        help="按内置分类分卷 (IMAGE/DOCUMENT/AUDIO/VIDEO/...)",
+    )
+    p_archive.add_argument(
+        "-r", "--recursive", action="store_true", help="递归子目录 (--by-category 必加)"
+    )
+    p_archive.add_argument(
+        "--dry-run", action="store_true", help="试运行 (不真写, 只列计划)"
+    )
+    p_archive.add_argument(
+        "--json", action="store_true", help="输出 JSON (便于脚本管道)"
+    )
+    p_archive.set_defaults(func=_cmd_archive)
 
     # ----- dedup-scan (W4 v4) -----
     p_dedup_scan = sub.add_parser(

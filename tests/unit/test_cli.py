@@ -548,3 +548,100 @@ class TestRenameNamespacedPlaceholder:
         assert r.returncode == 0
         # ":" 被 renamer.sanitize 替换成 "_" (Windows 非法字符)
         assert (tmp_path / "16_9_img.png").exists()
+
+
+
+# ============================================================
+# W10: archive CLI 测试
+# ============================================================
+
+
+class TestArchiveCLI:
+    """W10 归档子命令 CLI 测试 (走 subprocess)."""
+
+    def test_archive_dry_run_json(self, tmp_path: Path) -> None:
+        """--dry-run --json 输出文件列表."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A")
+        (src / "b.txt").write_text("B")
+        out = tmp_path / "out"
+        r = _run("archive", "-s", str(src), "-o", str(out), "--dry-run", "--json")
+        assert r.returncode == 0
+        data = json.loads(r.stdout)
+        assert data["mode"] == "single"
+        assert data["format"] == "zip"
+        assert data["count"] == 2
+        assert data["source"] == str(src.resolve())
+        # dry-run 不写文件
+        assert not (out / "archive.zip").exists()
+
+    def test_archive_real_zip(self, tmp_path: Path) -> None:
+        """真实归档 zip."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A")
+        (src / "b.txt").write_text("B")
+        out = tmp_path / "out"
+        r = _run("archive", "-s", str(src), "-o", str(out), "-n", "test")
+        assert r.returncode == 0
+        assert (out / "test.zip").is_file()
+        assert "归档完成" in r.stdout
+        assert "test.zip" in r.stdout
+
+    def test_archive_tar_gz(self, tmp_path: Path) -> None:
+        """--format tar.gz."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A")
+        out = tmp_path / "out"
+        r = _run("archive", "-s", str(src), "-o", str(out), "-n", "x", "--format", "tar.gz")
+        assert r.returncode == 0
+        assert (out / "x.tar.gz").is_file()
+
+    def test_archive_tar_bz2(self, tmp_path: Path) -> None:
+        """--format tar.bz2."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A")
+        out = tmp_path / "out"
+        r = _run("archive", "-s", str(src), "-o", str(out), "-n", "x", "--format", "tar.bz2")
+        assert r.returncode == 0
+        assert (out / "x.tar.bz2").is_file()
+
+    def test_archive_nonexistent_source(self, tmp_path: Path) -> None:
+        """源不存在 → 返 1."""
+        out = tmp_path / "out"
+        r = _run("archive", "-s", "/no/such/path/xyz", "-o", str(out))
+        assert r.returncode == 1
+        assert "不存在" in r.stderr
+
+    def test_archive_by_category(self, tmp_path: Path) -> None:
+        """--by-category 按类分卷."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("text")
+        (src / "b.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        out = tmp_path / "out"
+        r = _run("archive", "-s", str(src), "-o", str(out), "--by-category", "-r", "--json")
+        assert r.returncode == 0
+        data = json.loads(r.stdout)
+        # 至少 1 个分类
+        assert len(data) >= 1
+        for entry in data:
+            assert entry["status"] == "OK"
+            assert Path(entry["archive_path"]).is_file()
+
+    def test_archive_json_output(self, tmp_path: Path) -> None:
+        """--json 输出结构化结果."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "a.txt").write_text("A")
+        out = tmp_path / "out"
+        r = _run("archive", "-s", str(src), "-o", str(out), "-n", "test", "--json")
+        assert r.returncode == 0
+        data = json.loads(r.stdout)
+        assert len(data) == 1
+        assert data[0]["status"] == "OK"
+        assert data[0]["source_count"] == 1
+        assert data[0]["archive_path"].endswith("test.zip")
