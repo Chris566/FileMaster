@@ -385,7 +385,7 @@ python -m filemaster.cli dedup-undo restore --log <log-file>       # 恢复 move
 | **W7** | apply_with_progress 协作式取消 (CancellationToken) | ✅ 完成（389 测试） | core/cancellation.py · 取消即生效 · cancelled(n) 信号 · undo 只入已处理 |
 | **W8** | CancellationToken 推广到 Dedup / Preview Worker | ✅ 完成（405 测试） | 全 worker 统一取消契约 · 7 个新单测（dedup × 6 + preview × 2 − 1 共享 helper）· monkey-patch 减速模式 |
 | **W9** | 硬中断 safe_rename (单文件两步可中断) | ✅ 完成（431 测试） | 拆分 os.replace 为 Step A + 检查 + Step B · 源文件始终可控 · .filemaster.tmp.<8hex> 临时文件 · 29 个新单测（safe_rename 18 + renamer 6 + batch 2 + hash 3）|
-| **W10** | 归档 archive (zip / tar.gz / tar.bz2) | ✅ 完成（486 测试） | 3 种格式 · 进度 + 取消 + 原子写入 · UndoStack 集成 · CLI 子命令 · 51 个新单测 |
+| **W10** | 归档 archive (zip / tar.gz / tar.bz2) | ✅ 完成（508 测试） | 3 种格式 · 进度 + 取消 + 原子写入 · UndoStack 集成 · CLI 子命令 · **撤销 dispatcher** (restore_latest) · 73 个新单测 (51 + 22) |
 | W11-W13 | 飞书集成 + 右键菜单注册 | 🔜 | |
 | W14-W15 | 打包优化 + 自动更新 | 🔜 | |
 | W16 | v1.0 发布 | 🔜 | |

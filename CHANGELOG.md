@@ -175,6 +175,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 **累计**：486 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
 
+### Added (W10 follow-up)
+
+- **撤销 dispatcher**（`core/undo.py`）— `RestoreEntryResult` dataclass + `restore_entry()` 通用 dispatcher + UndoStack 挂 `restore_latest()` 一键 pop+还原
+  - `Archive` / `CopyOnly`：删除 target
+  - `Classify`：移动 target 回 source
+  - `Delete`：拒绝（不可恢复）
+  - `RenameAndOverwrite` / `RenameAndCopy` / `RenameOnly` / `OverwriteOnly`：从 backup_path 还原
+  - 未知 operation：返 `success=False` + `error="operation=... 尚未实现 dispatcher"`
+  - `overwrite` 参数控制 target 冲突时的行为（默认跳过）
+  - `dry_run` 参数只报告不真改
+- **集成**：`ArchiveWorker.run()` 完成 → 调 `undo.restore_latest()` → 归档文件被删，源文件保留
+
+### Tests (W10 follow-up)
+
+- `test_undo_dispatcher.py` — 22 个：RestoreEntryResult (1) / Archive 5 (删/跳/dry/None target/真归档还原) / CopyOnly (1) / Classify 3 (移回/overwrite 冲突/强制) / Delete 拒绝 (1) / Rename* 3 (还原 backup/无 backup/丢失 backup) / 未实现 (1) / UndoStack.restore_latest 5 (空栈/弹+还原/batch/dry-run 不删但 pop/LIFO) / Worker 集成 2 (单卷 + by_category)
+
+**累计**：508 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
+
 ## [0.1.0] - 2026-08-30
 
 ### Added (W1)
