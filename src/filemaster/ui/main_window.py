@@ -155,6 +155,9 @@ class MainWindow(QMainWindow):
         # 应用主题
         self._apply_theme(self._theme_name)
 
+        # W10 follow-up: 初始化时同步撤销按钮 enable (栈空时 disable)
+        self._refresh_undo_button_state()
+
         # 同步配置到 UI
         self._sync_config_to_ui()
 
@@ -1481,6 +1484,9 @@ class MainWindow(QMainWindow):
         self._dedup_action_thread = None
         self._dedup_action_worker = None
 
+        # W10 follow-up: dedup 动作后可能入 UndoStack, 刷新撤销按钮
+        self._refresh_undo_button_state()
+
         # 真动作后建议重新扫描
         if not batch.dry_run and batch.success_count > 0:
             ret = QMessageBox.question(
@@ -1671,6 +1677,9 @@ class MainWindow(QMainWindow):
         self._thread = None
         self._worker = None
 
+        # W10 follow-up: 批量重命名后可能入 UndoStack, 刷新撤销按钮
+        self._refresh_undo_button_state()
+
     def closeEvent(self, event) -> None:  # type: ignore[override]  # noqa: N802
         """窗口关闭时清理线程."""
         if self._thread is not None and self._thread.isRunning():
@@ -1703,30 +1712,48 @@ class MainWindow(QMainWindow):
     # ---------- 撤销 / 关于 ----------
 
     def _on_undo(self) -> None:
-        """W5 详细实现."""
-        batch = self._undo_stack.pop()
-        if not batch:
-            self._log("撤销栈为空")
-            return
-        import shutil
+        """W10 follow-up: 走 UndoStack.restore_latest() dispatcher 闭环.
 
-        for entry in batch:
-            try:
-                if entry.operation == "RenameOnly" and entry.target and entry.source:
-                    if entry.target.exists():
-                        entry.target.rename(entry.source)
-                        self._log(f"撤销: {entry.target.name} → {entry.source.name}")
-                elif (
-                    entry.operation == "OverwriteOnly"
-                    and entry.target
-                    and entry.backup_path
-                    and entry.backup_path.exists()
-                ):
-                    shutil.copy2(entry.backup_path, entry.target)
-                    self._log(f"恢复覆盖: {entry.target.name}")
-            except OSError as e:
-                self._log(f"撤销失败: {entry.target} - {e}")
-        self._log(f"已撤销 {len(batch)} 条操作")
+        流程:
+          1. 调 self._undo_stack.restore_latest() 一步 pop + restore
+          2. 把每个 RestoreEntryResult 按 success/skipped/failure 分类写入日志
+          3. 状态栏显示汇总
+          4. 刷新按钮 enable 状态(栈空时自动 disable)
+        """
+        results = self._undo_stack.restore_latest()
+        if not results:
+            self._log("↩ 撤销栈为空")
+            self.statusBar().showMessage("撤销栈为空")
+            return
+
+        ok = 0
+        skipped = 0
+        failed = 0
+        for r in results:
+            target_str = r.target.name if r.target else "<no-target>"
+            if r.success and not r.skipped:
+                self._log(f"✅ 撤销: {r.operation} · {target_str} · {r.message}")
+                ok += 1
+            elif r.skipped:
+                self._log(f"⚠️ 跳过: {r.operation} · {target_str} · {r.error or r.message}")
+                skipped += 1
+            else:
+                self._log(f"❌ 失败: {r.operation} · {target_str} · {r.error}")
+                failed += 1
+
+        summary = f"↩ 撤销完成 · 成功 {ok} · 跳过 {skipped} · 失败 {failed} · 栈深 {len(self._undo_stack)}"
+        self._log(summary)
+        self.statusBar().showMessage(summary[:80])
+        self._refresh_undo_button_state()
+
+    def _refresh_undo_button_state(self) -> None:
+        """根据 UndoStack 深度刷新主工具栏 ↶ 撤销按钮 enable + tooltip."""
+        depth = len(self._undo_stack)
+        self._btn_undo.setEnabled(depth > 0)
+        if depth > 0:
+            self._btn_undo.setToolTip(f"撤销最近一次操作（{depth} 步可撤销）· Ctrl+Z")
+        else:
+            self._btn_undo.setToolTip("撤销（撤销栈为空）· Ctrl+Z")
 
     def _on_redo(self) -> None:
         self._log("W5 才会接入重做栈。")
