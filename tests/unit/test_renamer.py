@@ -774,3 +774,162 @@ class TestApplyWithProgress:
         assert len(results) == 4
         for i in range(4):
             assert (tmp_path / f"00{i+1}_f{i}.txt").exists()
+
+
+# ---- W9: 硬中断 (Hard Interrupt) ----
+
+def _make_files(tmp_path: Path, count: int) -> list:
+    """W9 helper: 创建 count 个文件."""
+    files = []
+    for i in range(count):
+        f = tmp_path / f"f{i}.txt"
+        f.write_text(f"content-{i}")
+        files.append(f)
+    return files
+
+
+def _w9_cancel_at_step_a() -> callable:
+    """W9 取消触发器: 让 safe_rename 内部 Step A 后才看到 cancel.
+
+    机制: W7 检查在文件循环顶部 (call 1 = file 1 W7 顶),
+          W9 检查在 safe_rename Step A 后 (call 2 = file 1 W9 内).
+    返回 is_cancelled 闭包 — 第 1 次 False (放行 file 1), 之后 True.
+
+    这样:
+    - file 1 走完 W7 检查 (False), 进入 _apply_one, safe_rename Step A 后看到 True → ROLLBACK
+    - file 2 走 W7 检查 (True) → break, 不处理
+    """
+    counter = [0]
+
+    def is_cancelled() -> bool:
+        counter[0] += 1
+        # 第 1 次 (file 1 W7 顶): False
+        # 第 2 次 (file 1 W9 safe_rename 内): True
+        # 第 3 次起 (file 2+ W7 顶): True
+        return counter[0] >= 2
+
+    return is_cancelled
+
+
+class TestApplyOneRollbackW9:
+    """W9: _apply_one 内部取消 — 单文件 Step A 后检查 cancel, 触发 ROLLBACK."""
+
+    def test_first_file_cancelled_mid_rename_keeps_source(self, tmp_path: Path) -> None:
+        """第一个文件处理中取消, 源文件回原位."""
+        files = _make_files(tmp_path, 3)
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+        is_cancelled = _w9_cancel_at_step_a()
+
+        results = renamer.apply_with_progress(
+            files,
+            is_cancelled=is_cancelled,
+        )
+
+        # 第 1 个文件 ROLLBACK, 第 2/3 个文件 W7 在文件之间检查时发现 cancel → 不进入
+        assert len(results) == 1
+        assert results[0].status == "ROLLBACK"
+        assert results[0].source == files[0]
+        assert files[0].exists()
+        assert files[0].read_text() == "content-0"
+        assert files[1].exists()
+        assert files[2].exists()
+        # 无 .tmp 残留
+        assert list(tmp_path.glob("*.filemaster.tmp.*")) == []
+
+    def test_rollback_does_not_push_undo_entry(self, tmp_path: Path) -> None:
+        """ROLLBACK 状态不入 UndoStack (没真完成 rename)."""
+        files = _make_files(tmp_path, 3)
+        undo_stack = UndoStack()
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+        is_cancelled = _w9_cancel_at_step_a()
+
+        results = renamer.apply_with_progress(
+            files,
+            undo_stack=undo_stack,
+            is_cancelled=is_cancelled,
+        )
+
+        assert len(results) == 1
+        assert results[0].status == "ROLLBACK"
+        assert len(undo_stack) == 0
+        assert files[0].exists()
+
+    def test_overwrite_with_cancel_cleans_backup_orphan(self, tmp_path: Path) -> None:
+        """OVERWRITE + 取消: backup_path 已写但 target 没覆盖, 清理孤儿 backup."""
+        src = tmp_path / "src.txt"
+        src.write_text("new content")
+        dst = tmp_path / "dst.txt"
+        dst.write_text("old content")
+        undo_stack = UndoStack()
+
+        renamer = Renamer(Template("renamed_{OriginalName}"))
+        is_cancelled = _w9_cancel_at_step_a()
+        results = renamer.apply_with_progress(
+            [src],
+            conflict_strategy=ConflictStrategy.OVERWRITE,
+            undo_stack=undo_stack,
+            is_cancelled=is_cancelled,
+        )
+
+        assert len(results) == 1
+        assert results[0].status == "ROLLBACK"
+        assert src.exists()
+        assert dst.exists()
+        assert dst.read_text() == "old content"
+        # OVERWRITE 走了 backup, 但取消时 backup_path 被清掉, undo_stack 也无 entry
+        assert len(undo_stack) == 0
+        # 无 .tmp 残留
+        assert list(tmp_path.glob("*.filemaster.tmp.*")) == []
+
+    def test_normal_completion_still_works_after_w9(self, tmp_path: Path) -> None:
+        """W9 改动不破坏 W5/W6/W7 正常路径."""
+        files = _make_files(tmp_path, 3)
+        undo_stack = UndoStack()
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+
+        results = renamer.apply_with_progress(
+            files,
+            undo_stack=undo_stack,
+            is_cancelled=lambda: False,
+        )
+
+        assert len(results) == 3
+        assert all(r.status == "OK" for r in results)
+        assert len(undo_stack) == 1
+        for f in files:
+            assert not f.exists()
+        for i in range(3):
+            assert (tmp_path / f"00{i+1}_f{i}.txt").exists()
+        # 无 .tmp 残留 (sanity)
+        assert list(tmp_path.glob("*.filemaster.tmp.*")) == []
+
+
+class TestApplyEntryCleanupTmpsW9:
+    """W9: apply 入口清理 .tmp 残留."""
+
+    def test_apply_cleans_orphan_tmps(self, tmp_path: Path) -> None:
+        """apply 启动时自动清理源目录的 .tmp 残留."""
+        # 模拟上次取消时留下的 .tmp
+        orphan = tmp_path / "src.txt.filemaster.tmp.deadbeef"
+        orphan.write_text("leftover")
+
+        files = _make_files(tmp_path, 2)
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+
+        renamer.apply_with_progress(files)
+
+        assert not orphan.exists()
+        for i in range(2):
+            assert (tmp_path / f"00{i+1}_f{i}.txt").exists()
+
+    def test_apply_orphan_tmps_preserves_normal_files(self, tmp_path: Path) -> None:
+        """清理时不动普通文件."""
+        (tmp_path / "user_doc.txt").write_text("untouched")
+        (tmp_path / "user_doc.txt.filemaster.tmp.abc12345").write_text("tmp")
+
+        files = _make_files(tmp_path, 1)
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+        renamer.apply_with_progress(files)
+
+        assert (tmp_path / "user_doc.txt").exists()
+        assert not (tmp_path / "user_doc.txt.filemaster.tmp.abc12345").exists()

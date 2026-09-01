@@ -1,15 +1,23 @@
 """重命名引擎.
 
-W2 详细实现：
-- 规划（plan）：只生成结果，不动文件
-- 应用（apply）：真实文件 IO，支持 3 种冲突策略
-- 撤销联动：每个成功操作入 UndoStack
-- 冲突策略：skip / overwrite / rename_new
+W2 详细实现:
+- 规划 (plan): 只生成结果, 不动文件
+- 应用 (apply): 真实文件 IO, 支持 3 种冲突策略
+- 撤销联动: 每个成功操作入 UndoStack
+- 冲突策略: skip / overwrite / rename_new
 
-W5 扩展：
+W5 扩展:
 - 命名空间占位符 {pdf_*} / {word_*} / {excel_*} / {image_*}
   (e.g. {pdf_title} / {word_paragraphs} / {excel_sheet_name} / {image_taken_at})
-- apply_with_progress：每文件后回调 on_progress
+- apply_with_progress: 每文件后回调 on_progress
+
+W7 扩展:
+- apply_with_progress 接受 is_cancelled, 协作式取消 (文件之间检查)
+
+W9 扩展:
+- _apply_one 走 safe_rename, 硬中断 (Step A 后检查 cancel)
+- ROLLBACK 状态不入 UndoStack (没真完成)
+- cleanup_orphan_tmps 在 apply 入口清理 .tmp 残留
 """
 
 from __future__ import annotations
@@ -24,6 +32,11 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 
+from filemaster.core.safe_rename import (
+    SafeRenameResult,
+    cleanup_orphan_tmps,
+    safe_rename,
+)
 from filemaster.core.template import Template
 from filemaster.core.undo import UndoEntry, UndoStack
 from filemaster.utils.hash import file_hash
@@ -115,7 +128,7 @@ class RenameResult:
 
     source: Path
     target: Path | None
-    status: str  # OK | SKIPPED | CONFLICT | OVERWRITTEN | RENAMED | DRY_RUN | ERROR
+    status: str  # OK | SKIPPED | CONFLICT | OVERWRITTEN | RENAMED | DRY_RUN | ERROR | ROLLBACK
     message: str = ""
 
 
@@ -155,7 +168,7 @@ class Renamer:
 
     - plan(): 只生成 RenameResult，不动文件（dry-run）
     - apply(): 真实文件 IO，写 UndoStack（如提供）
-    - apply_with_progress(): apply + 逐文件进度回调
+    - apply_with_progress(): apply + 逐文件进度回调 + W7 取消 + W9 硬中断
     """
 
     def __init__(self, template: Template, prefix: str = "", start_index: int = 1) -> None:
@@ -366,6 +379,7 @@ class Renamer:
         files: Iterable[Path],
         conflict_strategy: ConflictStrategy = ConflictStrategy.SKIP,
         undo_stack: UndoStack | None = None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> list[RenameResult]:
         """真实执行重命名.
 
@@ -373,78 +387,25 @@ class Renamer:
             files: 源文件列表
             conflict_strategy: 冲突策略（skip / overwrite / rename_new）
             undo_stack: 可选，提供则把每次成功操作写入栈
+            is_cancelled: W7 协作式取消. W9 硬中断走 _apply_one, 此处也透传.
         Returns:
             RenameResult 列表
         """
+        # W9: 入口清理 .tmp 残留 (上轮取消 / 崩溃遗留)
+        self._cleanup_tmps(files)
+
         results: list[RenameResult] = []
         entries: list[UndoEntry] = []
 
         for file in files:
-            target = self._render_target(file)
-            if target is None:
-                results.append(RenameResult(file, None, "SKIPPED", "模板未变"))
-                self._index += 1
-                continue
+            # W7 协作式取消 — 文件之间检查
+            if is_cancelled is not None and is_cancelled():
+                break
+            result, entry = self._apply_one(file, conflict_strategy, undo_stack, is_cancelled)
+            results.append(result)
+            if entry is not None:
+                entries.append(entry)
 
-            # 冲突检测
-            if target.exists():
-                if conflict_strategy is ConflictStrategy.SKIP:
-                    results.append(
-                        RenameResult(file, target, "CONFLICT", f"目标已存在：{target.name}（已跳过）")
-                    )
-                    self._index += 1
-                    continue
-                if conflict_strategy is ConflictStrategy.RENAME_NEW:
-                    target = self._find_free_name(target)
-                    if target is None:
-                        results.append(
-                            RenameResult(file, None, "ERROR", f"无法找到空闲名：{file.name}")
-                        )
-                        self._index += 1
-                        continue
-                    # rename_new 的最终结果：用了新名
-                    final_status = "RENAMED"
-                    final_msg = f"已避开冲突：{target.name}"
-                else:  # OVERWRITE
-                    final_status = "OVERWRITTEN"
-                    final_msg = f"已覆盖：{target.name}"
-            else:
-                final_status = "OK"
-                final_msg = ""
-
-            # 执行 rename
-            try:
-                backup_path: Path | None = None
-                if (
-                    conflict_strategy is ConflictStrategy.OVERWRITE
-                    and target.exists()
-                    and undo_stack is not None
-                ):
-                    backup_path = UndoStack.backup(target, self._backup_dir(undo_stack))
-                # 使用 os.replace：POSIX 和 Windows 都是原子覆盖语义
-                # Path.rename 在 Windows 上目标已存在会抛 FileExistsError
-                os.replace(file, target)
-            except OSError as e:
-                results.append(RenameResult(file, target, "ERROR", str(e)))
-                self._index += 1
-                continue
-
-            results.append(RenameResult(file, target, final_status, final_msg))
-
-            # 写 UndoEntry
-            if undo_stack is not None:
-                entries.append(
-                    UndoEntry(
-                        operation="RenameOnly",
-                        source=file,
-                        target=target,
-                        backup_path=backup_path,
-                    )
-                )
-
-            self._index += 1
-
-        # 一次性入栈
         if undo_stack is not None and entries:
             undo_stack.push(entries)
 
@@ -460,6 +421,9 @@ class Renamer:
     ) -> list[RenameResult]:
         """W5: apply + 逐文件进度回调.
 
+        W7 协作式取消 (文件之间检查).
+        W9 硬中断 (_apply_one 内部 Step A 后检查).
+
         与 apply 行为一致, 但每处理完一个文件调 on_progress(current_index, total, file, result).
         on_progress 不抛异常, 内部吞掉.
 
@@ -468,22 +432,27 @@ class Renamer:
             conflict_strategy: 冲突策略
             undo_stack: 可选, 提供则写撤销栈
             on_progress: 回调 (i, total, file, result) -> None
-            is_cancelled: 可选取消回调, 返回 True 时停止处理剩余文件 (W7 协作式取消).
-                          取消发生在文件之间, 不会打断单文件处理. 已收集的
-                          results 仍返回, 已写入的 undo entries 仍入栈.
+            is_cancelled: 可选取消回调, 返回 True 时停止处理剩余文件.
+                          W7: 文件之间协作式检查.
+                          W9: _apply_one 内部 Step A 后硬中断检查.
+                          已收集的 results 仍返回, 已入栈的 entries 保留;
+                          ROLLBACK 状态的 file 不入栈 (没真完成).
         Returns:
             RenameResult 列表
         """
+        # W9: 入口清理 .tmp 残留
+        self._cleanup_tmps(files)
+
         files_list = list(files)
         total = len(files_list)
         results: list[RenameResult] = []
         entries: list[UndoEntry] = []
 
         for i, file in enumerate(files_list, 1):
-            # W7: 协作式取消 — 在文件之间检查, 不打断单文件
+            # W7 协作式取消 — 在文件之间检查
             if is_cancelled is not None and is_cancelled():
                 break
-            result, entry = self._apply_one(file, conflict_strategy, undo_stack)
+            result, entry = self._apply_one(file, conflict_strategy, undo_stack, is_cancelled)
             results.append(result)
             if entry is not None:
                 entries.append(entry)
@@ -501,8 +470,12 @@ class Renamer:
         file: Path,
         conflict_strategy: ConflictStrategy,
         undo_stack: UndoStack | None,
+        is_cancelled: Callable[[], bool] | None = None,
     ) -> tuple[RenameResult, UndoEntry | None]:
-        """单文件 apply, 返回 (result, undo_entry)."""
+        """单文件 apply, 返回 (result, undo_entry).
+
+        W9: 走 safe_rename. 取消时返回 ROLLBACK 状态, 不写 undo entry.
+        """
         target = self._render_target(file)
         if target is None:
             self._index += 1
@@ -532,19 +505,40 @@ class Renamer:
             final_status = "OK"
             final_msg = ""
 
-        try:
-            backup_path: Path | None = None
-            if (
-                conflict_strategy is ConflictStrategy.OVERWRITE
-                and target.exists()
-                and undo_stack is not None
-            ):
-                backup_path = UndoStack.backup(target, self._backup_dir(undo_stack))
-            os.replace(file, target)
-        except OSError as e:
-            self._index += 1
-            return RenameResult(file, target, "ERROR", str(e)), None
+        # W9: OVERWRITE 策略需要先备份被覆盖的目标 — 但 safe_rename 不直接做
+        # 走两步: (1) 备份 target (2) safe_rename(file -> target)
+        # 如 (1) 后取消, target 还在原位 (没动), 备份已写需清理
+        backup_path: Path | None = None
+        if (
+            conflict_strategy is ConflictStrategy.OVERWRITE
+            and target.exists()
+            and undo_stack is not None
+        ):
+            backup_path = UndoStack.backup(target, self._backup_dir(undo_stack))
 
+        # W9: safe_rename 内部 Step A 后检查 cancel, 取消时 ROLLBACK (源文件回原位)
+        safe_result: SafeRenameResult = safe_rename(file, target, is_cancelled)
+
+        if safe_result.status == "ROLLBACK":
+            # 取消: 源文件已在原位, 不写 undo entry
+            # 注意: backup_path 已写 (如果走了 OVERWRITE), 但因为源文件没动, target 也没被覆盖
+            # → backup 是个孤儿, 需要清理
+            if backup_path is not None:
+                with contextlib.suppress(OSError):
+                    backup_path.unlink()
+            self._index += 1
+            return RenameResult(file, target, "ROLLBACK", "已取消, 源文件保留"), None
+
+        if safe_result.status == "ERROR":
+            # safe_rename 失败: 源文件可能已动, 残留 .tmp
+            # OVERWRITE 走过的备份也是孤儿, 清掉
+            if backup_path is not None:
+                with contextlib.suppress(OSError):
+                    backup_path.unlink()
+            self._index += 1
+            return RenameResult(file, target, "ERROR", safe_result.message), None
+
+        # OK: rename 成功
         self._index += 1
         entry: UndoEntry | None = None
         if undo_stack is not None:
@@ -555,6 +549,25 @@ class Renamer:
                 backup_path=backup_path,
             )
         return RenameResult(file, target, final_status, final_msg), entry
+
+    @staticmethod
+    def _cleanup_tmps(files: Iterable[Path]) -> int:
+        """W9: 清理源文件所在目录的 .filemaster.tmp.* 残留.
+
+        入口调用 (apply / apply_with_progress 开头), 应对:
+        - 上轮取消时 safe_rename rollback 失败
+        - 进程在 Step A / Step B 之间被杀
+        - 用户手动 kill -9
+        """
+        cleaned = 0
+        seen_dirs: set[Path] = set()
+        for f in files:
+            d = f.parent if f.is_file() or not f.exists() else f
+            if d in seen_dirs:
+                continue
+            seen_dirs.add(d)
+            cleaned += cleanup_orphan_tmps(d)
+        return cleaned
 
     @staticmethod
     def _backup_dir(undo_stack: UndoStack) -> Path:

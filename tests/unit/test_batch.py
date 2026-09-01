@@ -212,3 +212,79 @@ class TestBatchWorker:
         assert worker.cancellation_token.is_cancelled is False
         worker.cancel()
         assert worker.cancellation_token.is_cancelled is True
+
+    # ---- W9: 硬中断 (hard interrupt) ----
+
+    def test_worker_hard_cancel_keeps_source_on_rollback(self, tmp_path: Path) -> None:
+        """W9: safe_rename 内部检测到 cancel → ROLLBACK, 源文件保留 + 无 .tmp 残留.
+
+        跟 W7 区别: W7 取消发生在文件之间 (loop 顶部检查), W9 取消发生在
+        单文件 _apply_one 内部 (safe_rename Step A 后检查).
+
+        触发方式: 用计数 is_cancelled — 第 1 次 (W7 文件循环顶) False,
+        第 2 次 (W9 safe_rename 内) True. 文件 1 到达 _apply_one,
+        在 safe_rename Step A 后检测到 cancel → ROLLBACK.
+        """
+        files = _make_files(tmp_path, 3)
+        # 用固定 template
+        renamer = Renamer(Template("{Index:D3}_{OriginalName}"))
+
+        # 用闭包计数: 第 2 次 (及之后) 调用返回 True (W7 顶 + W9 内 = 2 次/文件)
+        call_count = [0]
+
+        def is_cancelled() -> bool:
+            call_count[0] += 1
+            # 第 1 次 (file 1 的 W7 顶): False → 放行
+            # 第 2 次 (file 1 的 W9 safe_rename 内): True → ROLLBACK
+            # 第 3 次 (file 2 的 W7 顶): True → break (file 2 不处理)
+            return call_count[0] >= 2
+
+        results = renamer.apply_with_progress(
+            files,
+            conflict_strategy=ConflictStrategy.SKIP,
+            is_cancelled=is_cancelled,
+        )
+
+        # file 1 被处理 (ROLLBACK)
+        assert len(results) == 1
+        assert results[0].status == "ROLLBACK"
+        # 源文件回原位 (W9 关键 — W7 时源文件已被 os.replace, 状态 OK)
+        assert files[0].exists()
+        assert files[0].read_text() == "x"
+        # 后续文件没动
+        assert files[1].exists()
+        assert files[2].exists()
+        # 无 .tmp 残留
+        assert list(tmp_path.glob("*.filemaster.tmp.*")) == []
+
+    def test_worker_normal_run_no_orphan_tmps(self, tmp_path: Path) -> None:
+        """W9: 正常完成 run 不留 .tmp 残留 (sanity check)."""
+        files = _make_files(tmp_path, 3)
+        worker = BatchWorker(
+            files=files,
+            template=Template("{Index:D3}_{OriginalName}"),
+        )
+        _SignalRecorder(worker)
+        worker.run()
+
+        # 全部 rename 成功
+        for f in files:
+            assert not f.exists()
+        for i in range(3):
+            assert (tmp_path / f"00{i+1}_f{i}.txt").exists()
+        # 无 .tmp 残留
+        assert list(tmp_path.glob("*.filemaster.tmp.*")) == []
+
+    def test_worker_resume_token_works(self, tmp_path: Path) -> None:
+        """W9: token.reset() 后, is_cancelled 回到 False, 可复用."""
+        files = _make_files(tmp_path, 3)
+        worker = BatchWorker(
+            files=files,
+            template=Template("{Index:D3}_{OriginalName}"),
+        )
+        # 第 1 轮: 预取消
+        worker.cancellation_token.cancel()
+        assert worker.cancellation_token.is_cancelled is True
+        # Reset 后, token 回到未取消
+        worker.cancellation_token.reset()
+        assert worker.cancellation_token.is_cancelled is False
