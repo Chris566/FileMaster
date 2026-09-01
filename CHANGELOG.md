@@ -157,6 +157,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GitHub PATCH ref URL** — `/git/refs/heads/<branch>`（复数），单数 `/git/ref/heads/<branch>` PATCH 时返回 404
 - 路线图 W7-W10 "去重 UI" 提前到 W4 完成（见 README 项目状态表）
 
+## [0.10.0] - 2026-09-01
+
+### Added (W10)
+
+- **核心 `core/archiver.py`（~260 行）** — `ArchiveFormat` enum（zip / tar.gz / tar.bz2，extension + from_path）/ `ArchiveTask` + `ArchiveResult` + `ArchiveEntry` dataclass / `Archiver.archive()` 同步基础版 / `Archiver.archive_with_progress()` 带进度+取消 / `Archiver.archive_by_category()` 内置分类分卷 / `cleanup_archive_tmps()` 复用 W9 safe_rename 工具
+- **后台 `workers/archiver.py`（~160 行）** — `ArchiveWorker(QObject + QThread)` 模式；5 个信号（progressed / archive_done / cancelled / finished / failed）；与 `BatchWorker` 一致的 `cancellation_token` property 暴露；单卷 / 按 category 双模式；UndoStack 集成
+- **CLI `archive` 子命令** — `-s/--source` `-o/--output` `-n/--name` `--format {zip,tar.gz,tar.bz2}` `--compression 0-9` `--by-category` `-r/--recursive` `--dry-run` `--json`；threading 包装 + 进度条 + JSON 输出
+- **撤销支持** — `core/undo.py` 加 `"Archive"` 到 `OperationType` Literal；`UndoEntry(operation="Archive", target=archive_path)` 写入 UndoStack
+- **W9 集成** — `archive_with_progress` 走 `make_tmp_path` + `safe_rename` 双步；取消时 close + unlink tmp；原子移到目标路径不留残留
+
+### Tests (W10)
+
+- `test_archiver.py` — 34 个：ArchiveFormat enum (7) / Dataclasses (3) / archive 基础 3 格式 (5) / archive_with_progress (10, 含 3 种取消时序) / archive_by_category (4) / cleanup_archive_tmps (3) / safe_rename 协作 (2)
+- `test_archive_worker.py` — 10 个：单卷信号触发 (4) / 按 category (2) / 取消 (2) / 失败 (1) / 基础属性 (1)
+- `test_cli.py::TestArchiveCLI` — 7 个：dry-run JSON (1) / 真实 zip (1) / tar.gz (1) / tar.bz2 (1) / 源不存在 (1) / by-category (1) / --json 输出 (1)
+
+**累计**：486 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
+
 ## [0.1.0] - 2026-08-30
 
 ### Added (W1)

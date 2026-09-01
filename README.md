@@ -239,7 +239,92 @@ result: SafeRenameResult = safe_rename(
 - **元数据** — PDF (PyMuPDF) / Word (python-docx) / Excel (openpyxl) / Image (EXIF)
 - **预览** — 前 N 文件元数据快照
 
+### 归档 Archive（W10）— zip / tar.gz / tar.bz2
+
+W1 写了 `core/archiver.py` 骨架但没接任何能力，W10 把它做成完整模块：3 种格式 + 进度 + 取消 + 撤销。
+
+**核心 API**（`core/archiver.py`，~260 行）：
+
+```python
+from filemaster.core.archiver import ArchiveFormat, Archiver
+
+archiver = Archiver()
+
+# 1) 单卷: 进度 + 取消 + 原子写入 (W9 safe_rename 协作)
+result: ArchiveResult = archiver.archive_with_progress(
+    files, Path("backup.zip"),
+    fmt=ArchiveFormat.ZIP, compression=6,
+    on_progress=lambda i, t, f, b: print(f"{i}/{t} {f.name}"),
+    is_cancelled=lambda: token.is_cancelled,
+)
+# result.status: "OK" | "CANCELLED" | "ERROR"
+
+# 2) 按内置分类分卷: 自动生成 IMAGE.zip / DOCUMENT.zip / ...
+results: dict[str, ArchiveResult] = archiver.archive_by_category(
+    files, output_dir, fmt=ArchiveFormat.TAR_GZ,
+    on_progress=lambda cat, i, t, f, b: ...,
+    is_cancelled=lambda: ...,
+)
+```
+
+**写入策略**（W9 集成）：
+
+```
+原文件源目录
+   ↓ shutil / zip / tar 写入到
+.archive_path.filemaster.tmp.<8hex>    ← 取消时 unlink
+   ↓ safe_rename (Step A + check + Step B)
+最终 .archive_path                        ← 原子覆盖
+```
+
+**ArchiveFormat enum**：
+
+| 格式 | 扩展名 | mode 参数 | compresslevel |
+|---|---|---|---|
+| `ZIP` | `.zip` | `ZIP_DEFLATED` | 0-9 (0=STORE) |
+| `TAR_GZ` | `.tar.gz` | `w:gz` | 1-9 |
+| `TAR_BZ2` | `.tar.bz2` | `w:bz2` | 1-9 |
+
+**Worker**（`workers/archiver.py`，~160 行）— `ArchiveWorker(QObject + QThread)` 模式：
+
+- 5 个信号：`progressed(percent, file, i, t, msg)` / `archive_done(ArchiveResult)` / `cancelled(int)` / `finished(list)` / `failed(name, err)`
+- 与 `BatchWorker` 一致暴露 `cancellation_token` property
+- 单卷 / 按 category 双模式（`by_category=True` 走 `archive_by_category`）
+- 成功后写 UndoStack：`UndoEntry(operation="Archive", target=archive_path)`
+- 启动时 `cleanup_archive_tmps(output_dir)` 处理上次崩溃残留
+
+**CLI** — `archive` 子命令：
+
+```bash
+# 单卷 zip
+filemaster archive -s ./data -o ./backups -n project_2026
+
+# tar.gz
+filemaster archive -s ./data -o ./backups -n project_2026 --format tar.gz
+
+# 按类分卷 (递归子目录)
+filemaster archive -s ./data -o ./backups --by-category -r
+
+# JSON 管道
+filemaster archive -s ./data -o ./backups -n x --json
+```
+
+**撤销集成**（`core/undo.py`）：
+
+- `OperationType` Literal 加 `"Archive"` 选项
+- `UndoEntry(operation="Archive", target=archive_path)` 记录归档文件
+- 撤销 = 删除归档文件即可（撤销 dispatcher 待 W11 接入）
+
+**Tests** — 51 个新单测：
+
+- `test_archiver.py` — 34 个：ArchiveFormat enum (7) / Dataclasses (3) / archive 基础 3 格式 (5) / archive_with_progress (10, 含 3 种取消时序: pre-start / midway / during-write) / archive_by_category (4) / cleanup_archive_tmps (3) / safe_rename 协作 (2)
+- `test_archive_worker.py` — 10 个：单卷信号 (4) / 按 category (2) / 取消 (2) / 失败 (1) / 基础 (1)
+- `test_cli.py::TestArchiveCLI` — 7 个：dry-run JSON / 真实 zip / tar.gz / tar.bz2 / 源不存在 / by-category / --json
+
+**累计**：486 单测通过 / 0 失败 / 5 跳过（Windows-only）/ ruff clean。
+
 ### 去重 Dedup（W3-W4）— 完整闭环
+
 
 四阶段流水线：扫描 → 预览 → 动作 → 撤销。
 
@@ -300,7 +385,7 @@ python -m filemaster.cli dedup-undo restore --log <log-file>       # 恢复 move
 | **W7** | apply_with_progress 协作式取消 (CancellationToken) | ✅ 完成（389 测试） | core/cancellation.py · 取消即生效 · cancelled(n) 信号 · undo 只入已处理 |
 | **W8** | CancellationToken 推广到 Dedup / Preview Worker | ✅ 完成（405 测试） | 全 worker 统一取消契约 · 7 个新单测（dedup × 6 + preview × 2 − 1 共享 helper）· monkey-patch 减速模式 |
 | **W9** | 硬中断 safe_rename (单文件两步可中断) | ✅ 完成（431 测试） | 拆分 os.replace 为 Step A + 检查 + Step B · 源文件始终可控 · .filemaster.tmp.<8hex> 临时文件 · 29 个新单测（safe_rename 18 + renamer 6 + batch 2 + hash 3）|
-| W7-W10 | Dedup UI 阶段，W4 已超量完成 | ✅ W4 + W9 (硬中断) | W9 完成 hard interrupt safe_rename; W10 保留为后续可拓展 |
+| **W10** | 归档 archive (zip / tar.gz / tar.bz2) | ✅ 完成（486 测试） | 3 种格式 · 进度 + 取消 + 原子写入 · UndoStack 集成 · CLI 子命令 · 51 个新单测 |
 | W11-W13 | 飞书集成 + 右键菜单注册 | 🔜 | |
 | W14-W15 | 打包优化 + 自动更新 | 🔜 | |
 | W16 | v1.0 发布 | 🔜 | |
